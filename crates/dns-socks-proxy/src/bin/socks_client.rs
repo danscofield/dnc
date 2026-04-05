@@ -147,37 +147,35 @@ fn spawn_control_poller(
         let mut backoff = AdaptiveBackoff::new(poll_active, backoff_max);
 
         loop {
-            match transport.recv_frame(&recv_control_channel).await {
-                Ok(Some(data)) => {
-                    // Need at least 16 bytes for the trailing MAC.
-                    if data.len() < 16 {
-                        debug!(len = data.len(), "control poller: frame too short, discarding");
-                        backoff.increase();
-                        tokio::time::sleep(backoff.current()).await;
-                        continue;
+            match transport.recv_frames(&recv_control_channel).await {
+                Ok(frames) if !frames.is_empty() => {
+                    for data in frames {
+                        // Need at least 16 bytes for the trailing MAC.
+                        if data.len() < 16 {
+                            debug!(len = data.len(), "control poller: frame too short, discarding");
+                            continue;
+                        }
+
+                        let (frame_bytes, received_mac) = data.split_at(data.len() - 16);
+                        let mut mac_arr = [0u8; 16];
+                        mac_arr.copy_from_slice(received_mac);
+
+                        if !dns_socks_proxy::crypto::verify_control_mac(
+                            &psk,
+                            frame_bytes,
+                            &mac_arr,
+                        ) {
+                            debug!("control poller: MAC verification failed, discarding");
+                            continue;
+                        }
+
+                        // Dispatch the full raw bytes (including MAC) so that
+                        // handle_connection can re-verify for defense-in-depth.
+                        dispatcher.dispatch(&data);
                     }
-
-                    let (frame_bytes, received_mac) = data.split_at(data.len() - 16);
-                    let mut mac_arr = [0u8; 16];
-                    mac_arr.copy_from_slice(received_mac);
-
-                    if !dns_socks_proxy::crypto::verify_control_mac(
-                        &psk,
-                        frame_bytes,
-                        &mac_arr,
-                    ) {
-                        debug!("control poller: MAC verification failed, discarding");
-                        backoff.reset();
-                        tokio::time::sleep(backoff.current()).await;
-                        continue;
-                    }
-
-                    // Dispatch the full raw bytes (including MAC) so that
-                    // handle_connection can re-verify for defense-in-depth.
-                    dispatcher.dispatch(&data);
                     backoff.reset();
                 }
-                Ok(None) => {
+                Ok(_) => {
                     // Channel empty — increase backoff.
                     backoff.increase();
                 }

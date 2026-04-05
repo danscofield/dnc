@@ -185,14 +185,25 @@ impl<C: Clock> ChannelStore<C> {
 
         let mut result = Vec::new();
 
-        // If replay is non-empty, return replay contents first
-        if !ch.replay.is_empty() {
-            for msg in ch.replay.iter() {
-                if result.len() >= max {
-                    break;
-                }
-                result.push(msg.clone());
+        // Case A: Stale replay — new data arrived, discard replay and serve
+        // only new messages. This prevents stale frames from a completed
+        // session blocking delivery of new frames for the next session.
+        if !ch.replay.is_empty() && !ch.messages.is_empty() {
+            ch.replay.clear();
+            ch.replay_cursor = 0;
+            // Fall through to serve from messages queue below
+        } else if !ch.replay.is_empty() {
+            // Case B: Replay is non-empty but queue is empty — re-poll or
+            // final drain. Return replay contents one final time AND clear
+            // the replay buffer in the same call, so the next peek returns
+            // empty immediately (no extra confirming re-poll cycle needed).
+            let replay_result: Vec<StoredMessage> = ch.replay.iter().take(max).cloned().collect();
+            ch.replay.clear();
+            ch.replay_cursor = 0;
+            if !replay_result.is_empty() {
+                ch.last_activity = now;
             }
+            return replay_result;
         }
 
         // Fill remaining capacity from the messages queue
@@ -468,6 +479,167 @@ mod tests {
 
         assert_eq!(msg.timestamp, 0); // MockClock starts at 0
         assert_eq!(msg.expiry, base + Duration::from_secs(120));
+    }
+
+    // =========================================================================
+    // Bug Condition Exploration: Replay Buffer Stale Blocking (Task 1)
+    // =========================================================================
+
+    // **Validates: Property 1 (design.md) — Requirements 2.1, 2.2**
+    //
+    // Bug Condition Exploration: Stale Replay Blocks New Message Delivery
+    //
+    // For any non-empty replay buffer with new messages in the queue,
+    // peek_many returns the new messages immediately without stale replay
+    // entries.
+    //
+    // Steps: push initial messages → peek (creates replay) → push a NEW
+    // message → peek again → assert ONLY the new message is returned.
+    //
+    // On UNFIXED code this test is EXPECTED TO FAIL — confirming the bug
+    // exists: peek_many returns stale replay frames concatenated with the
+    // new message instead of just the new message.
+    proptest! {
+        #[test]
+        fn bug_condition_stale_replay_blocks_new_message_delivery(
+            initial_count in 1usize..=8,
+            initial_payloads in prop::collection::vec(
+                prop::collection::vec(any::<u8>(), 1..64),
+                1..=8,
+            ),
+            new_payload in prop::collection::vec(any::<u8>(), 1..64),
+        ) {
+            let n = initial_count.min(initial_payloads.len());
+            let clock = MockClock::new();
+            let mut store = ChannelStore::new(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(600),
+                clock,
+                32,
+            );
+
+            // Step 1: Push initial messages to the channel
+            for i in 0..n {
+                store.push("ctl-ch", "session1", initial_payloads[i].clone()).unwrap();
+            }
+
+            // Step 2: Peek to move messages into the replay buffer
+            let first_peek = store.peek_many("ctl-ch", 32);
+            prop_assert_eq!(
+                first_peek.len(),
+                n,
+                "First peek should return all {} initial messages",
+                n
+            );
+
+            // Step 3: Push a NEW message (simulating session #2's SYN-ACK)
+            let new_seq = store.push("ctl-ch", "session2", new_payload.clone()).unwrap();
+
+            // Step 4: Peek again — should return ONLY the new message
+            let second_peek = store.peek_many("ctl-ch", 32);
+
+            // Assert: the second peek should contain exactly 1 message (the new one)
+            prop_assert_eq!(
+                second_peek.len(),
+                1,
+                "Second peek should return only the 1 new message, \
+                 but got {} messages — stale replay entries are blocking \
+                 new message delivery",
+                second_peek.len()
+            );
+
+            // Assert: the returned message is the new one, not stale replay
+            prop_assert_eq!(
+                &second_peek[0].payload,
+                &new_payload,
+                "Second peek should return the new message payload"
+            );
+            prop_assert_eq!(
+                second_peek[0].sequence,
+                new_seq,
+                "Second peek should return the new message sequence number"
+            );
+            prop_assert_eq!(
+                &second_peek[0].sender_id,
+                "session2",
+                "Second peek should return the new message sender"
+            );
+        }
+    }
+
+    // **Validates: Property 2 (design.md) — Requirement 2.3**
+    //
+    // Bug Condition Exploration: Replay Buffer Requires Extra Poll Cycle to Clear
+    //
+    // For any non-empty replay buffer with empty queue, one peek_many call
+    // clears the replay so the next returns empty.
+    //
+    // Steps: push messages → peek (creates replay) → peek again with empty
+    // queue (should return replay and clear it) → peek a third time → assert
+    // the third peek returns empty.
+    //
+    // On UNFIXED code this test is EXPECTED TO FAIL — confirming the bug
+    // exists: the third peek still returns stale data because clearing
+    // requires an additional confirming re-poll cycle.
+    proptest! {
+        #[test]
+        fn bug_condition_replay_requires_extra_poll_cycle_to_clear(
+            msg_count in 1usize..=8,
+            payloads in prop::collection::vec(
+                prop::collection::vec(any::<u8>(), 1..64),
+                1..=8,
+            ),
+        ) {
+            let n = msg_count.min(payloads.len());
+            let clock = MockClock::new();
+            let mut store = ChannelStore::new(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(600),
+                clock,
+                32,
+            );
+
+            // Step 1: Push messages to the channel
+            for i in 0..n {
+                store.push("ctl-ch", "session1", payloads[i].clone()).unwrap();
+            }
+
+            // Step 2: First peek — moves messages from queue into replay buffer
+            let first_peek = store.peek_many("ctl-ch", 32);
+            prop_assert_eq!(
+                first_peek.len(),
+                n,
+                "First peek should return all {} messages",
+                n
+            );
+
+            // Step 3: Second peek — queue is empty, replay is non-empty.
+            // This should return the replay contents AND clear the replay
+            // buffer in the same call.
+            let second_peek = store.peek_many("ctl-ch", 32);
+            prop_assert_eq!(
+                second_peek.len(),
+                n,
+                "Second peek (re-poll) should return the {} replay messages",
+                n
+            );
+
+            // Step 4: Third peek — replay should now be cleared.
+            // On FIXED code this returns empty immediately.
+            // On UNFIXED code this still returns stale data because the
+            // replay was only cleared on the second peek but the result
+            // was already populated before clearing.
+            let third_peek = store.peek_many("ctl-ch", 32);
+            prop_assert_eq!(
+                third_peek.len(),
+                0,
+                "Third peek should return empty (replay cleared on second peek), \
+                 but got {} messages — replay requires extra poll cycle to clear",
+                third_peek.len()
+            );
+        }
     }
 
     // **Validates: Requirements 1.1, 1.2, 2.1, 2.2**
@@ -774,6 +946,87 @@ mod tests {
                 msg_count,
                 "queue_depth should equal the number of pushed messages"
             );
+        }
+    }
+
+    // **Validates: Property 3 (design.md) — Requirements 3.1, 3.2**
+    //
+    // Preservation: Replay Re-delivers Same Batch When No New Messages Pushed
+    //
+    // For any messages moved to the replay buffer, a subsequent peek_many
+    // call with no intervening push returns the same batch — preserving the
+    // lost-UDP-response recovery mechanism.
+    //
+    // Steps: push N messages → peek_many (moves messages to replay) →
+    // peek_many again with NO intervening push → assert the second peek
+    // returns the same messages with identical payloads and sequence numbers.
+    //
+    // This is a PRESERVATION test — it must PASS on both unfixed and fixed code.
+    proptest! {
+        #[test]
+        fn preservation_replay_redelivers_same_batch_no_new_push(
+            msg_count in 1usize..=8,
+            payloads in prop::collection::vec(
+                prop::collection::vec(any::<u8>(), 1..64),
+                1..=8,
+            ),
+            sender_id in "[a-z]{1,8}",
+        ) {
+            let n = msg_count.min(payloads.len());
+            let clock = MockClock::new();
+            let mut store = ChannelStore::new(
+                100,
+                Duration::from_secs(3600),
+                Duration::from_secs(600),
+                clock,
+                32,
+            );
+
+            // Step 1: Push N messages to the channel
+            let mut pushed_seqs = Vec::new();
+            for i in 0..n {
+                let seq = store.push("ctl-ch", &sender_id, payloads[i].clone()).unwrap();
+                pushed_seqs.push(seq);
+            }
+
+            // Step 2: First peek — moves messages from queue into replay buffer
+            let first_peek = store.peek_many("ctl-ch", 32);
+            prop_assert_eq!(
+                first_peek.len(),
+                n,
+                "First peek should return all {} pushed messages",
+                n
+            );
+
+            // Step 3: Second peek — NO intervening push.
+            // The replay buffer should re-deliver the same batch.
+            let second_peek = store.peek_many("ctl-ch", 32);
+
+            // Assert: same number of messages returned
+            prop_assert_eq!(
+                second_peek.len(),
+                first_peek.len(),
+                "Second peek (re-poll, no new push) should return the same {} messages, \
+                 but got {}",
+                first_peek.len(),
+                second_peek.len()
+            );
+
+            // Assert: same payloads in the same order
+            for i in 0..first_peek.len() {
+                prop_assert_eq!(
+                    &second_peek[i].payload,
+                    &first_peek[i].payload,
+                    "Replay re-delivery payload mismatch at index {}",
+                    i
+                );
+                prop_assert_eq!(
+                    second_peek[i].sequence,
+                    first_peek[i].sequence,
+                    "Replay re-delivery sequence mismatch at index {}",
+                    i
+                );
+            }
         }
     }
 }

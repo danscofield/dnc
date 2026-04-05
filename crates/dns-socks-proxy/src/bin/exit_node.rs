@@ -151,10 +151,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::time::sleep(backoff.current()) => {}
         }
 
-        match transport.recv_frame(&control_channel).await {
-            Ok(Some(data)) => {
+        match transport.recv_frames(&control_channel).await {
+            Ok(frames) if !frames.is_empty() => {
                 backoff.reset();
 
+                for data in frames {
                 // Need at least 16 bytes for MAC at the end.
                 if data.len() < 16 {
                     debug!("control frame too short, ignoring");
@@ -218,8 +219,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         debug!(frame_type = ?frame.frame_type, "unexpected frame type on control channel");
                     }
                 }
+                } // end for data in frames
             }
-            Ok(None) => {
+            Ok(_) => {
                 backoff.increase();
             }
             Err(e) => {
