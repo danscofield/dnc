@@ -107,6 +107,14 @@ pub struct SocksClientCli {
     /// Session setup timeout in milliseconds (default: 30000).
     #[arg(long, default_value_t = 30000)]
     pub connect_timeout_ms: u64,
+
+    /// Maximum number of parallel TXT data queries per poll cycle (default: 8).
+    #[arg(long, default_value_t = 8)]
+    pub max_parallel_queries: usize,
+
+    /// Maximum backoff interval in milliseconds (default: value of poll_idle_ms).
+    #[arg(long)]
+    pub backoff_max_ms: Option<u64>,
 }
 
 /// Validated configuration for the socks-client binary.
@@ -137,12 +145,21 @@ pub struct SocksClientConfig {
     pub poll_idle: Duration,
     /// Session setup timeout (default: 30s).
     pub connect_timeout: Duration,
+    /// Maximum number of parallel TXT data queries per poll cycle (default: 8).
+    pub max_parallel_queries: usize,
+    /// Maximum backoff interval (defaults to poll_idle).
+    pub backoff_max: Duration,
 }
 
 impl SocksClientCli {
     /// Parse CLI arguments and validate into a `SocksClientConfig`.
     pub fn into_config(self) -> Result<SocksClientConfig, ConfigError> {
         let psk = resolve_psk(self.psk.as_deref(), self.psk_file.as_deref())?;
+        let poll_idle = Duration::from_millis(self.poll_idle_ms);
+        let backoff_max = match self.backoff_max_ms {
+            Some(ms) => Duration::from_millis(ms),
+            None => poll_idle,
+        };
 
         Ok(SocksClientConfig {
             listen_addr: self.listen_addr,
@@ -156,8 +173,10 @@ impl SocksClientCli {
             max_retransmits: self.max_retransmits,
             window_size: self.window_size,
             poll_active: Duration::from_millis(self.poll_active_ms),
-            poll_idle: Duration::from_millis(self.poll_idle_ms),
+            poll_idle,
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            max_parallel_queries: self.max_parallel_queries.max(1),
+            backoff_max,
         })
     }
 }
@@ -221,6 +240,14 @@ pub struct ExitNodeCli {
     /// TCP connect timeout in milliseconds (default: 10000).
     #[arg(long, default_value_t = 10000)]
     pub connect_timeout_ms: u64,
+
+    /// Maximum number of parallel TXT data queries per poll cycle (default: 8).
+    #[arg(long, default_value_t = 8)]
+    pub max_parallel_queries: usize,
+
+    /// Maximum backoff interval in milliseconds (default: value of poll_idle_ms).
+    #[arg(long)]
+    pub backoff_max_ms: Option<u64>,
 }
 
 /// Validated configuration for the exit-node binary.
@@ -249,6 +276,10 @@ pub struct ExitNodeConfig {
     pub poll_idle: Duration,
     /// TCP connect timeout (default: 10s).
     pub connect_timeout: Duration,
+    /// Maximum number of parallel TXT data queries per poll cycle (default: 8).
+    pub max_parallel_queries: usize,
+    /// Maximum backoff interval (defaults to poll_idle).
+    pub backoff_max: Duration,
 }
 
 impl ExitNodeCli {
@@ -270,6 +301,12 @@ impl ExitNodeCli {
             }
         }
 
+        let poll_idle = Duration::from_millis(self.poll_idle_ms);
+        let backoff_max = match self.backoff_max_ms {
+            Some(ms) => Duration::from_millis(ms),
+            None => poll_idle,
+        };
+
         Ok(ExitNodeConfig {
             controlled_domain: self.domain,
             resolver_addr: self.resolver,
@@ -281,8 +318,10 @@ impl ExitNodeCli {
             max_retransmits: self.max_retransmits,
             window_size: self.window_size,
             poll_active: Duration::from_millis(self.poll_active_ms),
-            poll_idle: Duration::from_millis(self.poll_idle_ms),
+            poll_idle,
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            max_parallel_queries: self.max_parallel_queries.max(1),
+            backoff_max,
         })
     }
 }
@@ -406,6 +445,8 @@ mod tests {
             poll_active_ms: 50,
             poll_idle_ms: 500,
             connect_timeout_ms: 30000,
+            max_parallel_queries: 8,
+            backoff_max_ms: None,
         }
     }
 
@@ -447,6 +488,8 @@ mod tests {
             poll_active_ms: 50,
             poll_idle_ms: 500,
             connect_timeout_ms: 10000,
+            max_parallel_queries: 8,
+            backoff_max_ms: None,
         }
     }
 

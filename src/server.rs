@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::dns::{build_response, parse_dns_query};
-use crate::handler::handle_query;
+use crate::handler::{handle_query, handle_status, is_status_query_packet};
 use crate::store::{ChannelStore, RealClock};
 
 use hickory_proto::op::ResponseCode;
@@ -81,6 +81,8 @@ pub async fn run_server_loop(
 /// Process a single DNS packet: parse, route, and produce a response.
 ///
 /// If the packet is malformed (parse fails), returns a FORMERR response.
+/// Status queries acquire only a read lock on the store; send/receive
+/// queries acquire a write lock.
 async fn process_packet(
     packet: &[u8],
     config: &Config,
@@ -95,8 +97,13 @@ async fn process_packet(
                 query.query_type
             );
 
-            let mut store_guard = store.write().await;
-            let response = handle_query(&query, config, &mut store_guard);
+            let response = if is_status_query_packet(&query, config) {
+                let store_guard = store.read().await;
+                handle_status(&query, config, &*store_guard)
+            } else {
+                let mut store_guard = store.write().await;
+                handle_query(&query, config, &mut store_guard)
+            };
 
             tracing::debug!(
                 "Produced {} byte response for query id={:#06x}",
@@ -158,6 +165,7 @@ pub fn create_store(config: &Config) -> SharedStore {
         config.channel_inactivity_timeout(),
         config.message_ttl(),
         RealClock,
+        32,
     );
     Arc::new(RwLock::new(store))
 }
@@ -394,5 +402,78 @@ controlled_domain = "broker.example.com"
         let config = test_config();
         let _store = create_store(&config);
         // Just verify it doesn't panic
+    }
+
+    #[tokio::test]
+    async fn test_process_packet_status_query_empty_channel() {
+        let config = test_config();
+        let store = create_store(&config);
+
+        // Status query: <nonce>.status.<channel>.<controlled_domain>
+        let packet = build_query_bytes(
+            "a7k2.status.inbox.broker.example.com.",
+            RecordType::A,
+        );
+        let response = process_packet(&packet, &config, &store).await;
+        let msg = Message::from_vec(&response).unwrap();
+
+        assert_eq!(msg.response_code(), ResponseCode::NoError);
+        assert_eq!(msg.answers().len(), 1);
+        // Empty channel → 0.0.0.0
+        match msg.answers()[0].data() {
+            hickory_proto::rr::RData::A(a) => {
+                assert_eq!(a.0, std::net::Ipv4Addr::new(0, 0, 0, 0));
+            }
+            other => panic!("expected A record, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_packet_status_query_with_data() {
+        let config = test_config();
+        let store = create_store(&config);
+
+        // Push messages via send queries first
+        let send_packet = build_query_bytes(
+            "nonce1.nbsq.alice.inbox.broker.example.com.",
+            RecordType::A,
+        );
+        process_packet(&send_packet, &config, &store).await;
+        let send_packet2 = build_query_bytes(
+            "nonce2.nbsq.bob.inbox.broker.example.com.",
+            RecordType::A,
+        );
+        process_packet(&send_packet2, &config, &store).await;
+
+        // Now issue a status query — should report depth 2 → 128.0.0.2
+        let status_packet = build_query_bytes(
+            "a7k2.status.inbox.broker.example.com.",
+            RecordType::A,
+        );
+        let response = process_packet(&status_packet, &config, &store).await;
+        let msg = Message::from_vec(&response).unwrap();
+
+        assert_eq!(msg.response_code(), ResponseCode::NoError);
+        assert_eq!(msg.answers().len(), 1);
+        match msg.answers()[0].data() {
+            hickory_proto::rr::RData::A(a) => {
+                assert_eq!(a.0, std::net::Ipv4Addr::new(128, 0, 0, 2));
+            }
+            other => panic!("expected A record, got {:?}", other),
+        }
+
+        // Verify the status query didn't consume any messages (read-only)
+        let status_packet2 = build_query_bytes(
+            "b8m3.status.inbox.broker.example.com.",
+            RecordType::A,
+        );
+        let response2 = process_packet(&status_packet2, &config, &store).await;
+        let msg2 = Message::from_vec(&response2).unwrap();
+        match msg2.answers()[0].data() {
+            hickory_proto::rr::RData::A(a) => {
+                assert_eq!(a.0, std::net::Ipv4Addr::new(128, 0, 0, 2));
+            }
+            other => panic!("expected A record, got {:?}", other),
+        }
     }
 }

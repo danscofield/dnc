@@ -6,9 +6,36 @@ use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::Record;
 use hickory_proto::rr::{Name, RecordType};
 
+use std::net::Ipv4Addr;
+
 use crate::config::Config;
-use crate::dns::{build_response, DnsMessage};
+use crate::dns::{a_record, build_response, DnsMessage};
 use crate::store::{ChannelStore, Clock};
+
+/// Maximum value representable in 24 bits for status IP encoding.
+const MAX_DEPTH_24BIT: usize = 0x00FF_FFFF;
+
+/// First octet sentinel for status response IPs.
+const STATUS_OCTET: u8 = 128;
+
+/// No-data IP returned when a channel's queue is empty or doesn't exist.
+const NO_DATA_IP: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
+
+/// Encode a queue depth into a status IP address.
+/// First octet = 128, remaining 24 bits = depth (clamped to 0x00FF_FFFF).
+/// For depth 0, returns 0.0.0.0.
+fn encode_status_ip(depth: usize) -> Ipv4Addr {
+    if depth == 0 {
+        return NO_DATA_IP;
+    }
+    let clamped = depth.min(MAX_DEPTH_24BIT) as u32;
+    Ipv4Addr::new(
+        STATUS_OCTET,
+        ((clamped >> 16) & 0xFF) as u8,
+        ((clamped >> 8) & 0xFF) as u8,
+        (clamped & 0xFF) as u8,
+    )
+}
 
 /// Check whether the query name is under the controlled domain.
 ///
@@ -35,11 +62,112 @@ fn is_under_controlled_domain(query_labels: &[String], controlled_domain: &str) 
     true
 }
 
+/// Detect whether the remaining labels (after stripping the controlled domain)
+/// represent a status query.
+///
+/// Status query format: `<nonce>.status.<channel>.<controlled_domain>`
+/// After stripping the controlled domain, remaining labels are: `[nonce, status, channel]`
+/// We check that there are at least 3 labels and that the second label (index 1) is "status".
+fn is_status_query(remaining_labels: &[&str]) -> bool {
+    remaining_labels.len() >= 3
+        && remaining_labels[1].eq_ignore_ascii_case("status")
+}
+
+/// Handle a status query: look up queue depth, encode as A record with TTL 0.
+///
+/// Takes an immutable reference to the store (read-only operation).
+/// For empty or non-existent channels, returns A record with `0.0.0.0`.
+///
+/// This function is public so that `server.rs` can call it directly
+/// when holding a read lock (status queries don't need a write lock).
+pub fn handle_status<C: Clock>(
+    query: &DnsMessage,
+    config: &Config,
+    store: &ChannelStore<C>,
+) -> Vec<u8> {
+    let labels = &query.query_name_labels;
+
+    // Split controlled domain into labels to determine how many to strip
+    let domain_labels: Vec<&str> = config
+        .controlled_domain
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let remaining_count = labels.len().saturating_sub(domain_labels.len());
+    let remaining: Vec<&str> = labels[..remaining_count].iter().map(|s| s.as_str()).collect();
+
+    // remaining should be [nonce, "status", channel]
+    // Channel is at index 2
+    let channel = if remaining.len() >= 3 {
+        remaining[2]
+    } else {
+        // Malformed — treat as empty channel
+        ""
+    };
+
+    let depth = store.queue_depth(channel);
+    let ip = encode_status_ip(depth);
+    let record = a_record(&query.query_name, ip);
+
+    build_response(
+        query.query_id,
+        &query.query_name,
+        query.query_type,
+        ResponseCode::NoError,
+        vec![record],
+    )
+    .unwrap_or_default()
+}
+
+/// Extract the remaining labels from a query name after stripping the controlled domain suffix.
+///
+/// Returns the labels before the controlled domain as `&str` slices.
+fn extract_remaining_labels<'a>(
+    query_labels: &'a [String],
+    controlled_domain: &str,
+) -> Vec<&'a str> {
+    let domain_labels: Vec<&str> = controlled_domain
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let remaining_count = query_labels.len().saturating_sub(domain_labels.len());
+    query_labels[..remaining_count]
+        .iter()
+        .map(|s| s.as_str())
+        .collect()
+}
+
+/// Check whether a parsed DNS query is a status query.
+///
+/// This is a public helper intended to be called from `server.rs` BEFORE
+/// acquiring the store lock, so the server can choose a read lock for status
+/// queries and a write lock for send/receive queries.
+///
+/// Returns `true` if the query is an A/AAAA query under the controlled domain
+/// whose remaining labels match the status query pattern
+/// (`<nonce>.status.<channel>`).
+pub fn is_status_query_packet(query: &DnsMessage, config: &Config) -> bool {
+    match query.query_type {
+        RecordType::A | RecordType::AAAA => {
+            if !is_under_controlled_domain(&query.query_name_labels, &config.controlled_domain) {
+                return false;
+            }
+            let remaining = extract_remaining_labels(
+                &query.query_name_labels,
+                &config.controlled_domain,
+            );
+            is_status_query(&remaining)
+        }
+        _ => false,
+    }
+}
+
 /// Route an incoming DNS query to the appropriate handler and produce a response.
 ///
 /// Routing logic:
 /// 1. Check if query name is under the controlled domain → REFUSED if not
-/// 2. A/AAAA queries → send handler
+/// 2. A/AAAA queries → check for status query first; if yes, route to `handle_status`; otherwise route to `handle_send`
 /// 3. TXT queries → receive handler
 /// 4. Other query types → REFUSED
 pub fn handle_query<C: Clock>(
@@ -61,7 +189,16 @@ pub fn handle_query<C: Clock>(
 
     match query.query_type {
         RecordType::A | RecordType::AAAA => {
-            handle_send(query, config, store)
+            let remaining = extract_remaining_labels(
+                &query.query_name_labels,
+                &config.controlled_domain,
+            );
+            if is_status_query(&remaining) {
+                // Status queries only need immutable access
+                handle_status(query, config, &*store)
+            } else {
+                handle_send(query, config, store)
+            }
         }
         RecordType::TXT => {
             handle_receive(query, config, store)
@@ -228,7 +365,7 @@ fn handle_receive<C: Clock>(
         1
     };
 
-    let messages = store.pop_many(channel, max_messages);
+    let messages = store.peek_many(channel, max_messages);
     if messages.is_empty() {
         // No messages — NOERROR with zero answers
         return build_response(
@@ -296,7 +433,7 @@ mod tests {
     fn test_query_outside_controlled_domain_returns_refused() {
         let config = test_config();
         let clock = MockClock::new();
-        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock);
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
 
         let query = make_dns_message("nonce.something.other.com.", RecordType::A);
         let response_bytes = handle_query(&query, &config, &mut store);
@@ -309,7 +446,7 @@ mod tests {
     fn test_query_under_controlled_domain_a_record_routes_to_send() {
         let config = test_config();
         let clock = MockClock::new();
-        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock);
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
 
         // nonce.payload.sender.channel.broker.example.com
         // payload "me" base32 = "nvsq"
@@ -329,7 +466,7 @@ mod tests {
     fn test_query_under_controlled_domain_txt_routes_to_receive() {
         let config = test_config();
         let clock = MockClock::new();
-        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock);
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
 
         // TXT query for receive: nonce.channel.broker.example.com
         let query = make_dns_message(
@@ -348,7 +485,7 @@ mod tests {
     fn test_unsupported_query_type_returns_refused() {
         let config = test_config();
         let clock = MockClock::new();
-        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock);
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
 
         let query = make_dns_message(
             "abc12345.inbox.broker.example.com.",
@@ -364,7 +501,7 @@ mod tests {
     fn test_send_then_receive_roundtrip() {
         let config = test_config();
         let clock = MockClock::new();
-        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock);
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
 
         // Send: nonce.payload.sender.channel.broker.example.com
         // payload "hi" base32 = "nbsq"
@@ -429,7 +566,7 @@ mod tests {
     fn test_send_bad_structure_returns_nxdomain() {
         let config = test_config();
         let clock = MockClock::new();
-        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock);
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
 
         // Too few labels for a valid send query (only nonce + domain)
         let query = make_dns_message(
@@ -446,7 +583,7 @@ mod tests {
     fn test_receive_bad_structure_returns_nxdomain() {
         let config = test_config();
         let clock = MockClock::new();
-        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock);
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
 
         // Only domain labels, no nonce or channel
         let query = make_dns_message(
@@ -464,7 +601,7 @@ mod tests {
     fn test_response_has_aa_flag() {
         let config = test_config();
         let clock = MockClock::new();
-        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock);
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
 
         let query = make_dns_message(
             "abc12345.inbox.broker.example.com.",
@@ -474,5 +611,193 @@ mod tests {
         let response = parse_response(&response_bytes);
 
         assert!(response.authoritative());
+    }
+
+    // --- encode_status_ip tests ---
+
+    #[test]
+    fn test_encode_status_ip_zero_returns_no_data() {
+        assert_eq!(encode_status_ip(0), Ipv4Addr::new(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_encode_status_ip_one() {
+        assert_eq!(encode_status_ip(1), Ipv4Addr::new(128, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_encode_status_ip_max_24bit() {
+        assert_eq!(encode_status_ip(0x00FF_FFFF), Ipv4Addr::new(128, 255, 255, 255));
+    }
+
+    #[test]
+    fn test_encode_status_ip_clamped() {
+        // Values above 24-bit max should clamp to 128.255.255.255
+        assert_eq!(encode_status_ip(0x0100_0000), Ipv4Addr::new(128, 255, 255, 255));
+        assert_eq!(encode_status_ip(usize::MAX), Ipv4Addr::new(128, 255, 255, 255));
+    }
+
+    #[test]
+    fn test_encode_status_ip_mid_value() {
+        // depth = 256 = 0x000100 → 128.0.1.0
+        assert_eq!(encode_status_ip(256), Ipv4Addr::new(128, 0, 1, 0));
+    }
+
+    // --- is_status_query tests ---
+
+    #[test]
+    fn test_is_status_query_valid() {
+        let labels = vec!["a7k2", "status", "d-aBcD1234"];
+        assert!(is_status_query(&labels));
+    }
+
+    #[test]
+    fn test_is_status_query_case_insensitive() {
+        let labels = vec!["nonce", "STATUS", "channel"];
+        assert!(is_status_query(&labels));
+        let labels = vec!["nonce", "Status", "channel"];
+        assert!(is_status_query(&labels));
+    }
+
+    #[test]
+    fn test_is_status_query_too_few_labels() {
+        let labels = vec!["nonce", "status"];
+        assert!(!is_status_query(&labels));
+        let labels: Vec<&str> = vec![];
+        assert!(!is_status_query(&labels));
+    }
+
+    #[test]
+    fn test_is_status_query_wrong_position() {
+        // "status" at index 0 instead of index 1
+        let labels = vec!["status", "nonce", "channel"];
+        assert!(!is_status_query(&labels));
+    }
+
+    #[test]
+    fn test_is_status_query_no_status_label() {
+        let labels = vec!["nonce", "payload", "sender", "channel"];
+        assert!(!is_status_query(&labels));
+    }
+
+    // --- handle_status tests ---
+
+    #[test]
+    fn test_handle_status_empty_channel_returns_no_data_ip() {
+        let config = test_config();
+        let clock = MockClock::new();
+        let store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
+
+        let query = make_dns_message(
+            "a7k2.status.inbox.broker.example.com.",
+            RecordType::A,
+        );
+        let response_bytes = handle_status(&query, &config, &store);
+        let response = parse_response(&response_bytes);
+
+        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert_eq!(response.answers().len(), 1);
+        let ans = &response.answers()[0];
+        assert_eq!(ans.ttl(), 0);
+        match ans.data() {
+            hickory_proto::rr::RData::A(a) => assert_eq!(a.0, Ipv4Addr::new(0, 0, 0, 0)),
+            other => panic!("expected A record, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_status_nonexistent_channel_returns_no_data_ip() {
+        let config = test_config();
+        let clock = MockClock::new();
+        let store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
+
+        let query = make_dns_message(
+            "a7k2.status.nonexistent.broker.example.com.",
+            RecordType::A,
+        );
+        let response_bytes = handle_status(&query, &config, &store);
+        let response = parse_response(&response_bytes);
+
+        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert_eq!(response.answers().len(), 1);
+        let ans = &response.answers()[0];
+        assert_eq!(ans.ttl(), 0);
+        match ans.data() {
+            hickory_proto::rr::RData::A(a) => assert_eq!(a.0, Ipv4Addr::new(0, 0, 0, 0)),
+            other => panic!("expected A record, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_status_with_messages_returns_depth() {
+        let config = test_config();
+        let clock = MockClock::new();
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
+
+        // Push 3 messages to the "inbox" channel
+        store.push("inbox", "alice", b"msg1".to_vec()).unwrap();
+        store.push("inbox", "bob", b"msg2".to_vec()).unwrap();
+        store.push("inbox", "alice", b"msg3".to_vec()).unwrap();
+
+        let query = make_dns_message(
+            "a7k2.status.inbox.broker.example.com.",
+            RecordType::A,
+        );
+        let response_bytes = handle_status(&query, &config, &store);
+        let response = parse_response(&response_bytes);
+
+        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert_eq!(response.answers().len(), 1);
+        let ans = &response.answers()[0];
+        assert_eq!(ans.ttl(), 0);
+        match ans.data() {
+            hickory_proto::rr::RData::A(a) => {
+                // depth 3 → 128.0.0.3
+                assert_eq!(a.0, Ipv4Addr::new(128, 0, 0, 3));
+            }
+            other => panic!("expected A record, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_handle_status_is_read_only() {
+        let config = test_config();
+        let clock = MockClock::new();
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
+
+        store.push("inbox", "alice", b"msg1".to_vec()).unwrap();
+        store.push("inbox", "bob", b"msg2".to_vec()).unwrap();
+
+        assert_eq!(store.queue_depth("inbox"), 2);
+
+        let query = make_dns_message(
+            "a7k2.status.inbox.broker.example.com.",
+            RecordType::A,
+        );
+        // Call handle_status — should not modify the store
+        let _ = handle_status(&query, &config, &store);
+
+        // Queue depth should be unchanged
+        assert_eq!(store.queue_depth("inbox"), 2);
+    }
+
+    #[test]
+    fn test_handle_status_ttl_is_zero() {
+        let config = test_config();
+        let clock = MockClock::new();
+        let mut store = ChannelStore::new(100, Duration::from_secs(3600), Duration::from_secs(600), clock, 32);
+
+        store.push("inbox", "alice", b"msg".to_vec()).unwrap();
+
+        let query = make_dns_message(
+            "nonce.status.inbox.broker.example.com.",
+            RecordType::A,
+        );
+        let response_bytes = handle_status(&query, &config, &store);
+        let response = parse_response(&response_bytes);
+
+        for ans in response.answers() {
+            assert_eq!(ans.ttl(), 0, "Status response TTL must be 0");
+        }
     }
 }

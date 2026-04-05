@@ -37,6 +37,9 @@ pub enum TransportError {
 
     #[error("Store error: {0}")]
     StoreError(String),
+
+    #[error("Unrecognized status IP: {0}")]
+    UnrecognizedStatusIp(Ipv4Addr),
 }
 
 /// Well-known broker response IPs.
@@ -57,6 +60,44 @@ const DEFAULT_CHANNEL_FULL_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Maximum channel-full retries before giving up.
 const MAX_CHANNEL_FULL_RETRIES: usize = 5;
+
+/// Maximum value representable in 24 bits.
+const MAX_DEPTH_24BIT: usize = 0x00FF_FFFF;
+
+/// Status IP sentinel: first octet for status responses.
+const STATUS_OCTET: u8 = 128;
+
+/// No-data IP returned when a channel's queue is empty.
+const NO_DATA_IP: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
+
+/// Encode a queue depth into a status IP address.
+/// First octet = 128, remaining 24 bits = depth (clamped to 0x00FF_FFFF).
+pub fn encode_status_ip(depth: usize) -> Ipv4Addr {
+    let clamped = depth.min(MAX_DEPTH_24BIT) as u32;
+    Ipv4Addr::new(
+        STATUS_OCTET,
+        ((clamped >> 16) & 0xFF) as u8,
+        ((clamped >> 8) & 0xFF) as u8,
+        (clamped & 0xFF) as u8,
+    )
+}
+
+/// Decode a status IP response into a queue depth.
+/// Returns `Ok(0)` for `0.0.0.0`, `Ok(depth)` for `128.x.x.x`,
+/// `Err` for any other IP.
+pub fn decode_status_ip(ip: Ipv4Addr) -> Result<usize, TransportError> {
+    if ip == NO_DATA_IP {
+        return Ok(0);
+    }
+    let octets = ip.octets();
+    if octets[0] == STATUS_OCTET {
+        let depth = ((octets[1] as usize) << 16)
+            | ((octets[2] as usize) << 8)
+            | (octets[3] as usize);
+        return Ok(depth);
+    }
+    Err(TransportError::UnrecognizedStatusIp(ip))
+}
 
 /// UDP receive buffer size — large enough for EDNS0 responses.
 const UDP_BUF_SIZE: usize = 4096;
@@ -84,6 +125,9 @@ pub trait TransportBackend: Send + Sync {
         let mut frames = self.recv_frames(channel).await?;
         Ok(if frames.is_empty() { None } else { Some(frames.remove(0)) })
     }
+
+    /// Query the queue depth for a channel.
+    async fn query_status(&self, channel: &str) -> Result<usize, TransportError>;
 }
 
 /// DNS-based transport: sends/receives via DNS A/TXT queries.
@@ -229,6 +273,15 @@ impl DnsTransport {
             .map_err(|e| TransportError::DnsProtocol(format!("invalid DNS name: {e}")))
     }
 
+    /// Build the status query name: `<nonce>.status.<channel>.<domain>`
+    fn build_status_query_name(&self, channel: &str) -> Result<Name, TransportError> {
+        let nonce = Self::generate_nonce();
+        let full_name = format!("{}.status.{}.{}.", nonce, channel, self.controlled_domain);
+
+        Name::from_ascii(&full_name)
+            .map_err(|e| TransportError::DnsProtocol(format!("invalid DNS name: {e}")))
+    }
+
     /// Build the receive query name: `<nonce>.<channel>.<domain>`
     fn build_recv_query_name(&self, channel: &str) -> Result<Name, TransportError> {
         let nonce = Self::generate_nonce();
@@ -347,8 +400,124 @@ impl TransportBackend for DnsTransport {
         }
         Ok(frames)
     }
+
+    async fn query_status(&self, channel: &str) -> Result<usize, TransportError> {
+        let query_name = self.build_status_query_name(channel)?;
+        let query_bytes = Self::build_dns_query(&query_name, RecordType::A)?;
+        let response_bytes = self.send_dns_query(&query_bytes).await?;
+        let ip = Self::parse_a_response(&response_bytes)?;
+        decode_status_ip(ip)
+    }
 }
 
+
+// ---------------------------------------------------------------------------
+// Parallel data retrieval
+// ---------------------------------------------------------------------------
+
+/// Fire `count` parallel TXT recv queries on separate ephemeral UDP sockets.
+/// Returns all successfully received frame payloads, flattened.
+/// Each query uses a unique nonce. Failed/timed-out queries are logged and skipped.
+pub async fn recv_frames_parallel(
+    resolver_addr: SocketAddr,
+    controlled_domain: &str,
+    channel: &str,
+    count: usize,
+    query_timeout: Duration,
+) -> Vec<Vec<u8>> {
+    if count == 0 {
+        return vec![];
+    }
+
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for _ in 0..count {
+        let resolver = resolver_addr;
+        let domain = controlled_domain.to_string();
+        let chan = channel.to_string();
+        let timeout = query_timeout;
+
+        join_set.spawn(async move {
+            recv_single_parallel_query(resolver, &domain, &chan, timeout).await
+        });
+    }
+
+    let mut all_frames = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(frames)) => all_frames.extend(frames),
+            Ok(Err(e)) => {
+                debug!("parallel recv query failed: {e}");
+            }
+            Err(e) => {
+                warn!("parallel recv task panicked: {e}");
+            }
+        }
+    }
+
+    all_frames
+}
+
+/// Execute a single parallel TXT recv query on its own ephemeral UDP socket.
+async fn recv_single_parallel_query(
+    resolver_addr: SocketAddr,
+    controlled_domain: &str,
+    channel: &str,
+    query_timeout: Duration,
+) -> Result<Vec<Vec<u8>>, TransportError> {
+    // 1. Bind an ephemeral UDP socket
+    let bind_addr: SocketAddr = if resolver_addr.is_ipv6() {
+        "[::]:0".parse().unwrap()
+    } else {
+        "0.0.0.0:0".parse().unwrap()
+    };
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|e| TransportError::SocketBind(format!("parallel socket bind: {e}")))?;
+
+    // 2. Generate a unique nonce
+    let nonce = DnsTransport::generate_nonce();
+
+    // 3. Build the TXT query name: <nonce>.<channel>.<domain>
+    let full_name = format!("{}.{}.{}.", nonce, channel, controlled_domain);
+    let query_name = Name::from_ascii(&full_name)
+        .map_err(|e| TransportError::DnsProtocol(format!("invalid DNS name: {e}")))?;
+
+    // 4. Build and send the DNS query
+    let query_bytes = DnsTransport::build_dns_query(&query_name, RecordType::TXT)?;
+    socket.send_to(&query_bytes, resolver_addr).await?;
+
+    // 5. Wait for response with timeout
+    let mut buf = vec![0u8; UDP_BUF_SIZE];
+    let response_bytes = match tokio::time::timeout(query_timeout, socket.recv_from(&mut buf)).await
+    {
+        Ok(Ok((len, _addr))) => {
+            buf.truncate(len);
+            buf
+        }
+        Ok(Err(e)) => return Err(TransportError::Io(e)),
+        Err(_) => return Err(TransportError::Timeout(1)),
+    };
+    // Socket is dropped here (closed after use)
+
+    // 6. Parse TXT records and decode envelopes
+    let envelopes = DnsTransport::parse_txt_responses(&response_bytes)?;
+    if envelopes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // 7. Return the frame payloads
+    let mut frames = Vec::with_capacity(envelopes.len());
+    for envelope_str in envelopes {
+        match dns_message_broker::encoding::decode_envelope(&envelope_str) {
+            Ok(parts) => frames.push(parts.payload),
+            Err(e) => {
+                debug!("parallel recv: failed to decode envelope: {e}");
+            }
+        }
+    }
+    Ok(frames)
+}
 
 // ---------------------------------------------------------------------------
 // Payload budget calculation
@@ -441,12 +610,63 @@ impl TransportBackend for DirectTransport {
 
     async fn recv_frames(&self, channel: &str) -> Result<Vec<Vec<u8>>, TransportError> {
         let mut store = self.store.write().await;
-        // DirectTransport pops multiple messages at once for consistency.
+        // DirectTransport uses pop_many (destructive) because it operates
+        // in-process — there is no network loss between the store and the
+        // consumer. The replay window (peek_many) is only needed for the
+        // DNS/UDP path where responses can be silently lost.
         let msgs = store.pop_many(channel, 10);
         Ok(msgs.into_iter().map(|msg| msg.payload).collect())
     }
+
+    async fn query_status(&self, channel: &str) -> Result<usize, TransportError> {
+        let store = self.store.read().await;
+        Ok(store.queue_depth(channel))
+    }
 }
 
+
+// ---------------------------------------------------------------------------
+// Adaptive exponential backoff
+// ---------------------------------------------------------------------------
+
+/// Adaptive exponential backoff for poll intervals.
+///
+/// Starts at `min`, doubles on each `increase()` call (clamped to `max`),
+/// and resets to `min` on `reset()`.
+#[derive(Debug, Clone)]
+pub struct AdaptiveBackoff {
+    current: Duration,
+    min: Duration,
+    max: Duration,
+}
+
+impl AdaptiveBackoff {
+    /// Create a new `AdaptiveBackoff` starting at `min`.
+    /// If `max < min`, `max` is clamped to `min`.
+    pub fn new(min: Duration, max: Duration) -> Self {
+        let max = if max < min { min } else { max };
+        Self {
+            current: min,
+            min,
+            max,
+        }
+    }
+
+    /// Double the current interval, clamped to `max`.
+    pub fn increase(&mut self) {
+        self.current = (self.current * 2).min(self.max);
+    }
+
+    /// Reset the interval to `min`.
+    pub fn reset(&mut self) {
+        self.current = self.min;
+    }
+
+    /// Return the current interval.
+    pub fn current(&self) -> Duration {
+        self.current
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,10 +19,178 @@ use dns_socks_proxy::frame::{
 };
 use dns_socks_proxy::session::{SessionManager, SessionState};
 use dns_socks_proxy::socks::{socks5_handshake, socks5_reply};
-use dns_socks_proxy::transport::{compute_payload_budget, DnsTransport, TransportBackend};
+use dns_socks_proxy::transport::{
+    compute_payload_budget, recv_frames_parallel, AdaptiveBackoff, DnsTransport, TransportBackend,
+};
 
 /// Nonce length used in DNS queries.
 const NONCE_LEN: usize = 4;
+
+// ---------------------------------------------------------------------------
+// ControlDispatcher — demultiplexes control channel frames to per-session mpsc channels
+// ---------------------------------------------------------------------------
+
+/// Routes incoming control-channel frames to the correct session by `SessionId`.
+///
+/// Internally holds a `HashMap<SessionId, mpsc::Sender<Vec<u8>>>` behind a
+/// `std::sync::Mutex` (not tokio — critical sections are just HashMap lookups).
+pub struct ControlDispatcher {
+    senders: std::sync::Mutex<HashMap<SessionId, tokio::sync::mpsc::Sender<Vec<u8>>>>,
+}
+
+impl ControlDispatcher {
+    /// Create an empty dispatcher with no registered sessions.
+    pub fn new() -> Self {
+        Self {
+            senders: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register a session and return its dedicated receiver.
+    ///
+    /// Creates a `tokio::sync::mpsc` channel with buffer size 4, stores the
+    /// `Sender` side keyed by `session_id`, and hands back the `Receiver`.
+    pub fn register(&self, session_id: SessionId) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        self.senders.lock().unwrap().insert(session_id, tx);
+        rx
+    }
+
+    /// Deregister a session, dropping its sender and closing the channel.
+    pub fn deregister(&self, session_id: &SessionId) {
+        self.senders.lock().unwrap().remove(session_id);
+    }
+
+    /// Dispatch raw frame bytes to the matching session.
+    ///
+    /// Extracts the `session_id` from the first 9 bytes of `frame_bytes`
+    /// (byte 0 = session_id_len, always 8; bytes 1..9 = session_id).
+    /// Sends the *full* raw bytes (including any trailing MAC) through the
+    /// per-session mpsc sender.
+    ///
+    /// If the frame is too short, the session is unknown, or the channel is
+    /// full, a warning is logged and the frame is discarded.
+    pub fn dispatch(&self, frame_bytes: &[u8]) {
+        if frame_bytes.len() < 9 {
+            warn!(len = frame_bytes.len(), "control frame too short to extract session_id, discarding");
+            return;
+        }
+
+        // byte 0 is session_id_len (always 8)
+        let sid_len = frame_bytes[0] as usize;
+        if sid_len != 8 || frame_bytes.len() < 1 + sid_len {
+            warn!(sid_len, "unexpected session_id_len in control frame, discarding");
+            return;
+        }
+
+        let mut sid_bytes = [0u8; 8];
+        sid_bytes.copy_from_slice(&frame_bytes[1..9]);
+        let session_id = SessionId(sid_bytes);
+
+        let senders = self.senders.lock().unwrap();
+        if let Some(tx) = senders.get(&session_id) {
+            match tx.try_send(frame_bytes.to_vec()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    warn!(session_id = %session_id, "per-session control channel full, discarding frame");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(session_id = %session_id, "per-session control channel closed, discarding frame");
+                }
+            }
+        } else {
+            warn!(session_id = %session_id, "no registered session for control frame, discarding");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DispatcherGuard — RAII guard that deregisters on drop
+// ---------------------------------------------------------------------------
+
+/// RAII guard that calls `dispatcher.deregister(&session_id)` when dropped.
+///
+/// This guarantees deregistration in ALL exit paths — including `?` propagation,
+/// early returns, and panics — without requiring manual `deregister` calls at
+/// every return site.
+struct DispatcherGuard {
+    dispatcher: Arc<ControlDispatcher>,
+    session_id: SessionId,
+}
+
+impl Drop for DispatcherGuard {
+    fn drop(&mut self) {
+        self.dispatcher.deregister(&self.session_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Control channel poller — single background task that polls ctl-<client_id>
+// ---------------------------------------------------------------------------
+
+/// Spawn a background task that continuously polls the control channel and
+/// dispatches incoming frames to the correct per-session mpsc channel via
+/// the [`ControlDispatcher`].
+///
+/// The task runs indefinitely (until the process exits). It uses
+/// [`AdaptiveBackoff`] to avoid hammering the broker when no frames are
+/// available, and resets the backoff whenever a frame is received.
+fn spawn_control_poller(
+    transport: Arc<DnsTransport>,
+    dispatcher: Arc<ControlDispatcher>,
+    recv_control_channel: String,
+    psk: Psk,
+    poll_active: Duration,
+    backoff_max: Duration,
+) {
+    tokio::spawn(async move {
+        let mut backoff = AdaptiveBackoff::new(poll_active, backoff_max);
+
+        loop {
+            match transport.recv_frame(&recv_control_channel).await {
+                Ok(Some(data)) => {
+                    // Need at least 16 bytes for the trailing MAC.
+                    if data.len() < 16 {
+                        debug!(len = data.len(), "control poller: frame too short, discarding");
+                        backoff.increase();
+                        tokio::time::sleep(backoff.current()).await;
+                        continue;
+                    }
+
+                    let (frame_bytes, received_mac) = data.split_at(data.len() - 16);
+                    let mut mac_arr = [0u8; 16];
+                    mac_arr.copy_from_slice(received_mac);
+
+                    if !dns_socks_proxy::crypto::verify_control_mac(
+                        &psk,
+                        frame_bytes,
+                        &mac_arr,
+                    ) {
+                        debug!("control poller: MAC verification failed, discarding");
+                        backoff.reset();
+                        tokio::time::sleep(backoff.current()).await;
+                        continue;
+                    }
+
+                    // Dispatch the full raw bytes (including MAC) so that
+                    // handle_connection can re-verify for defense-in-depth.
+                    dispatcher.dispatch(&data);
+                    backoff.reset();
+                }
+                Ok(None) => {
+                    // Channel empty — increase backoff.
+                    backoff.increase();
+                }
+                Err(e) => {
+                    debug!(error = %e, "control poller: transport error");
+                    backoff.increase();
+                }
+            }
+
+            tokio::time::sleep(backoff.current()).await;
+        }
+    });
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,6 +224,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared config values wrapped in Arc for spawned tasks.
     let shared_config = Arc::new(config);
 
+    // Create the control channel dispatcher (demuxes control frames to per-session channels).
+    let dispatcher = Arc::new(ControlDispatcher::new());
+
+    // Create a dedicated DnsTransport for the control channel poller.
+    let poller_transport = Arc::new(
+        DnsTransport::new(shared_config.resolver_addr, shared_config.controlled_domain.clone()).await?,
+    );
+
+    // Compute the receive control channel name.
+    let recv_control_channel = format!("ctl-{}", shared_config.client_id);
+
+    // Spawn the single background control channel poller.
+    spawn_control_poller(
+        poller_transport,
+        Arc::clone(&dispatcher),
+        recv_control_channel,
+        shared_config.psk.clone(),
+        shared_config.poll_active,
+        shared_config.backoff_max,
+    );
+
     // Accept loop.
     loop {
         let (stream, peer_addr) = listener.accept().await?;
@@ -62,9 +252,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let session_manager = Arc::clone(&session_manager);
         let config = Arc::clone(&shared_config);
+        let dispatcher = Arc::clone(&dispatcher);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, session_manager, config).await {
+            if let Err(e) = handle_connection(stream, session_manager, config, dispatcher).await {
                 warn!(%peer_addr, error = %e, "session failed");
             }
         });
@@ -76,6 +267,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     session_manager: Arc<Mutex<SessionManager>>,
     config: Arc<SocksClientConfig>,
+    dispatcher: Arc<ControlDispatcher>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create a per-session DNS transport (own UDP socket to avoid response cross-contamination).
     let transport = Arc::new(
@@ -108,8 +300,16 @@ async fn handle_connection(
     };
 
     let send_control_channel = format!("ctl-{}", config.exit_node_id);
-    let recv_control_channel = format!("ctl-{}", config.client_id);
     info!(session_id = %session_id, "session created");
+
+    // Register with the control dispatcher to receive routed control frames.
+    // The DispatcherGuard guarantees deregistration on all exit paths (including
+    // `?` propagation and panics) via its Drop impl.
+    let mut control_rx = dispatcher.register(session_id.clone());
+    let _dispatcher_guard = DispatcherGuard {
+        dispatcher: Arc::clone(&dispatcher),
+        session_id: session_id.clone(),
+    };
 
     // 3. Generate X25519 keypair and send SYN.
     let (secret, pubkey) = generate_keypair();
@@ -130,103 +330,98 @@ async fn handle_connection(
         .await?;
     debug!(session_id = %session_id, "SYN sent");
 
-    // 4. Poll client's control channel for SYN-ACK with timeout.
+    // 4. Wait for SYN-ACK via the per-session dispatcher channel.
     let connect_timeout = config.connect_timeout;
-    let deadline = tokio::time::Instant::now() + connect_timeout;
     let session_key: SessionKey;
 
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            warn!(session_id = %session_id, "SYN-ACK timeout");
-            socks5_reply(&mut stream, 0x04).await.ok(); // host unreachable
-            cleanup_session(&session_manager, &session_id).await;
-            return Ok(());
-        }
+    match tokio::time::timeout(connect_timeout, control_rx.recv()).await {
+        Ok(Some(data)) => {
+            // Process the received raw bytes (MAC + frame).
+            // Need at least 16 bytes for MAC.
+            if data.len() < 16 {
+                warn!(session_id = %session_id, "control frame too short");
+                cleanup_session(&session_manager, &session_id).await;
+                return Ok(());
+            }
+            let (frame_bytes, received_mac) = data.split_at(data.len() - 16);
+            let mut mac_arr = [0u8; 16];
+            mac_arr.copy_from_slice(received_mac);
 
-        tokio::time::sleep(config.poll_active).await;
+            // Defense-in-depth MAC verification (poller already verified).
+            if !dns_socks_proxy::crypto::verify_control_mac(&config.psk, frame_bytes, &mac_arr) {
+                debug!(session_id = %session_id, "control frame MAC verification failed");
+                cleanup_session(&session_manager, &session_id).await;
+                return Ok(());
+            }
 
-        match transport.recv_frame(&recv_control_channel).await {
-            Ok(Some(data)) => {
-                // Need at least 16 bytes for MAC at the end.
-                if data.len() < 16 {
-                    debug!("control frame too short, ignoring");
-                    continue;
+            let frame = match decode_frame(frame_bytes) {
+                Ok(f) => f,
+                Err(e) => {
+                    debug!(session_id = %session_id, error = %e, "failed to decode control frame");
+                    cleanup_session(&session_manager, &session_id).await;
+                    return Ok(());
                 }
-                let (frame_bytes, received_mac) = data.split_at(data.len() - 16);
-                let mut mac_arr = [0u8; 16];
-                mac_arr.copy_from_slice(received_mac);
+            };
 
-                if !dns_socks_proxy::crypto::verify_control_mac(
-                    &config.psk,
-                    frame_bytes,
-                    &mac_arr,
-                ) {
-                    debug!("control frame MAC verification failed, ignoring");
-                    continue;
-                }
+            // Session ID check (defense-in-depth — dispatcher already routed correctly).
+            if frame.session_id != session_id {
+                debug!(session_id = %session_id, "control frame for different session after dispatch");
+                cleanup_session(&session_manager, &session_id).await;
+                return Ok(());
+            }
 
-                let frame = match decode_frame(frame_bytes) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        debug!(error = %e, "failed to decode control frame");
-                        continue;
-                    }
-                };
-
-                if frame.session_id != session_id {
-                    debug!("control frame for different session, ignoring");
-                    continue;
-                }
-
-                match frame.frame_type {
-                    FrameType::SynAck => {
-                        // Extract exit node pubkey (first 32 bytes of payload).
-                        if frame.payload.len() < 32 {
-                            warn!(session_id = %session_id, "SYN-ACK payload too short");
-                            continue;
-                        }
-                        let mut exit_pubkey = [0u8; 32];
-                        exit_pubkey.copy_from_slice(&frame.payload[..32]);
-
-                        let exit_public =
-                            x25519_dalek::PublicKey::from(exit_pubkey);
-                        let shared_secret = secret.diffie_hellman(&exit_public);
-
-                        session_key =
-                            derive_session_key(shared_secret.as_bytes(), &config.psk)?;
-
-                        // Update session state.
-                        {
-                            let mut mgr = session_manager.lock().await;
-                            if let Some(session) = mgr.get_session(&session_id) {
-                                session.state = SessionState::Established;
-                                session.session_key = Some(SessionKey {
-                                    data_key: session_key.data_key,
-                                    control_key: session_key.control_key,
-                                });
-                            }
-                        }
-
-                        info!(session_id = %session_id, "session established");
-                        break;
-                    }
-                    FrameType::Rst => {
-                        warn!(session_id = %session_id, "received RST during setup");
-                        socks5_reply(&mut stream, 0x05).await.ok(); // connection refused
+            match frame.frame_type {
+                FrameType::SynAck => {
+                    // Extract exit node pubkey (first 32 bytes of payload).
+                    if frame.payload.len() < 32 {
+                        warn!(session_id = %session_id, "SYN-ACK payload too short");
                         cleanup_session(&session_manager, &session_id).await;
                         return Ok(());
                     }
-                    _ => {
-                        debug!(frame_type = ?frame.frame_type, "unexpected control frame type during setup");
-                        continue;
+                    let mut exit_pubkey = [0u8; 32];
+                    exit_pubkey.copy_from_slice(&frame.payload[..32]);
+                    let exit_public = x25519_dalek::PublicKey::from(exit_pubkey);
+                    let shared_secret = secret.diffie_hellman(&exit_public);
+                    session_key = derive_session_key(shared_secret.as_bytes(), &config.psk)?;
+
+                    // Update session state.
+                    {
+                        let mut mgr = session_manager.lock().await;
+                        if let Some(session) = mgr.get_session(&session_id) {
+                            session.state = SessionState::Established;
+                            session.session_key = Some(SessionKey {
+                                data_key: session_key.data_key,
+                                control_key: session_key.control_key,
+                            });
+                        }
                     }
+                    info!(session_id = %session_id, "session established");
+                }
+                FrameType::Rst => {
+                    warn!(session_id = %session_id, "received RST during setup");
+                    socks5_reply(&mut stream, 0x05).await.ok();
+                    cleanup_session(&session_manager, &session_id).await;
+                    return Ok(());
+                }
+                _ => {
+                    debug!(session_id = %session_id, frame_type = ?frame.frame_type, "unexpected control frame type during setup");
+                    cleanup_session(&session_manager, &session_id).await;
+                    return Ok(());
                 }
             }
-            Ok(None) => continue,
-            Err(e) => {
-                debug!(error = %e, "transport error polling control channel");
-                continue;
-            }
+        }
+        Ok(None) => {
+            // Channel closed (dispatcher shutdown).
+            warn!(session_id = %session_id, "control channel closed during setup");
+            cleanup_session(&session_manager, &session_id).await;
+            return Ok(());
+        }
+        Err(_) => {
+            // Timeout.
+            warn!(session_id = %session_id, "SYN-ACK timeout");
+            socks5_reply(&mut stream, 0x04).await.ok();
+            cleanup_session(&session_manager, &session_id).await;
+            return Ok(());
         }
     }
 
@@ -324,7 +519,7 @@ async fn handle_connection(
         }
     }
 
-    // Cleanup.
+    // Cleanup — dispatcher deregistration is handled by _dispatcher_guard's Drop impl.
     info!(session_id = %session_id, "session ending, cleaning up");
     cleanup_session(&session_manager, &session_id).await;
     Ok(())
@@ -436,17 +631,10 @@ async fn downstream_task(
         data_key,
         control_key: [0u8; 32],
     };
-    let mut idle_count: u32 = 0;
+    let mut backoff = AdaptiveBackoff::new(config.poll_active, config.backoff_max);
+    let query_timeout = Duration::from_secs(2);
 
     loop {
-        // Adaptive polling: use active interval when data is flowing, idle when not.
-        let poll_interval = if idle_count > 5 {
-            config.poll_idle
-        } else {
-            config.poll_active
-        };
-        tokio::time::sleep(poll_interval).await;
-
         // Check session is still alive.
         {
             let mgr = session_manager.lock().await;
@@ -462,12 +650,48 @@ async fn downstream_task(
             }
         }
 
-        match transport.recv_frames(&downstream_channel).await {
+        // Phase 1: Query status to determine queue depth.
+        let frames_result = match transport.query_status(&downstream_channel).await {
+            Ok(0) => {
+                // No data available — increase backoff and sleep.
+                backoff.increase();
+                tokio::time::sleep(backoff.current()).await;
+                continue;
+            }
+            Ok(depth) => {
+                // Data available — reset backoff and fire parallel queries.
+                backoff.reset();
+                let count = depth.min(config.max_parallel_queries);
+                let parallel_frames = recv_frames_parallel(
+                    config.resolver_addr,
+                    &config.controlled_domain,
+                    &downstream_channel,
+                    count,
+                    query_timeout,
+                )
+                .await;
+                Ok(parallel_frames)
+            }
+            Err(e) => {
+                // Status query failed — fall back to single recv_frames call.
+                debug!(error = %e, "status query failed, falling back to single recv_frames");
+                match transport.recv_frames(&downstream_channel).await {
+                    Ok(frames) => Ok(frames),
+                    Err(e2) => Err(e2),
+                }
+            }
+        };
+
+        // Phase 2: Process received frames through the decryption/reassembly/ACK pipeline.
+        match frames_result {
             Ok(frames) if frames.is_empty() => {
-                idle_count = idle_count.saturating_add(1);
+                // No frames received — increase backoff and sleep.
+                backoff.increase();
+                tokio::time::sleep(backoff.current()).await;
             }
             Ok(frames) => {
-                idle_count = 0;
+                // Data received — reset backoff; will immediately re-poll (no sleep).
+                backoff.reset();
                 for data in frames {
 
                 let frame = match decode_frame(&data) {
@@ -594,7 +818,8 @@ async fn downstream_task(
             }
             Err(e) => {
                 debug!(error = %e, "transport error polling downstream");
-                idle_count = idle_count.saturating_add(1);
+                backoff.increase();
+                tokio::time::sleep(backoff.current()).await;
             }
         }
     }
@@ -755,4 +980,260 @@ async fn cleanup_session(session_manager: &Arc<Mutex<SessionManager>>, session_i
     let mut mgr = session_manager.lock().await;
     mgr.remove_session(session_id);
     debug!(session_id = %session_id, "session cleaned up");
+}
+
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// Task 1 — Bug condition exploration test.
+// Originally commented out because ControlDispatcher did not exist on unfixed code.
+// Now re-enabled (Task 3.6) to verify the dispatch mechanism works correctly.
+
+#[cfg(test)]
+mod tests {
+    use dns_socks_proxy::frame::{encode_frame, Frame, FrameFlags, FrameType, SessionId};
+    use proptest::prelude::*;
+    use tokio::sync::mpsc::error::TryRecvError;
+    use super::ControlDispatcher;
+
+    /// Generate a random valid 8-byte alphanumeric SessionId.
+    fn arb_session_id() -> impl Strategy<Value = SessionId> {
+        proptest::collection::vec(
+            proptest::sample::select(
+                b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                    .iter()
+                    .copied()
+                    .collect::<Vec<u8>>(),
+            ),
+            8,
+        )
+        .prop_map(|bytes| {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&bytes);
+            SessionId(arr)
+        })
+    }
+
+    /// Generate a set of N unique session IDs (2..=10).
+    fn arb_unique_session_ids() -> impl Strategy<Value = Vec<SessionId>> {
+        proptest::collection::hash_set(arb_session_id(), 2..=10)
+            .prop_map(|set| set.into_iter().collect::<Vec<_>>())
+    }
+
+    // **Validates: Requirements 1.2**
+    //
+    // Property 1: Bug Condition — Control frame dispatch to correct session.
+    //
+    // For any set of N registered sessions (N >= 2) and a control frame whose
+    // session_id matches session K, the ControlDispatcher SHALL deliver that
+    // frame's raw bytes to session K's mpsc receiver and to no other session's
+    // receiver.
+    proptest! {
+        #[test]
+        fn control_frame_dispatched_only_to_target_session(
+            session_ids in arb_unique_session_ids(),
+            target_idx_seed in any::<usize>(),
+            payload in proptest::collection::vec(any::<u8>(), 0..128),
+        ) {
+            let dispatcher = ControlDispatcher::new();
+
+            // Register all sessions and collect their receivers.
+            let mut receivers: Vec<(SessionId, tokio::sync::mpsc::Receiver<Vec<u8>>)> = Vec::new();
+            for sid in &session_ids {
+                let rx = dispatcher.register(sid.clone());
+                receivers.push((sid.clone(), rx));
+            }
+
+            // Pick a target session.
+            let target_idx = target_idx_seed % session_ids.len();
+            let target_sid = session_ids[target_idx].clone();
+
+            // Build a frame for the target session and encode it.
+            let frame = Frame {
+                session_id: target_sid.clone(),
+                seq: 0,
+                frame_type: FrameType::SynAck,
+                flags: FrameFlags::empty(),
+                payload: payload.clone(),
+            };
+            let frame_bytes = encode_frame(&frame);
+
+            // Dispatch the frame.
+            dispatcher.dispatch(&frame_bytes);
+
+            // Assert: only the target session's receiver gets the frame.
+            for (sid, rx) in &mut receivers {
+                if *sid == target_sid {
+                    match rx.try_recv() {
+                        Ok(received) => {
+                            prop_assert_eq!(&received, &frame_bytes);
+                        }
+                        Err(TryRecvError::Empty) => {
+                            return Err(proptest::test_runner::TestCaseError::fail(
+                                format!("target session {} did not receive the frame", sid),
+                            ));
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            return Err(proptest::test_runner::TestCaseError::fail(
+                                format!("target session {} channel disconnected", sid),
+                            ));
+                        }
+                    }
+                } else {
+                    match rx.try_recv() {
+                        Err(TryRecvError::Empty) => { /* expected — no cross-delivery */ }
+                        Ok(_) => {
+                            return Err(proptest::test_runner::TestCaseError::fail(
+                                format!("non-target session {} received a frame (cross-delivery!)", sid),
+                            ));
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            return Err(proptest::test_runner::TestCaseError::fail(
+                                format!("non-target session {} channel disconnected", sid),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Preservation property tests (Task 2)
+// ---------------------------------------------------------------------------
+// These tests verify frame decode/encode behaviors that MUST be preserved
+// after the ControlDispatcher fix. They run on UNFIXED code and must PASS.
+
+#[cfg(test)]
+mod preservation_tests {
+    use dns_socks_proxy::frame::{
+        decode_frame, encode_frame, Frame, FrameFlags, FrameType, SessionId,
+    };
+    use proptest::prelude::*;
+
+    /// Generate a random valid 8-byte alphanumeric SessionId.
+    fn arb_session_id() -> impl Strategy<Value = SessionId> {
+        proptest::collection::vec(
+            proptest::sample::select(
+                b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+                    .iter()
+                    .copied()
+                    .collect::<Vec<u8>>(),
+            ),
+            8,
+        )
+        .prop_map(|bytes| {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&bytes);
+            SessionId(arr)
+        })
+    }
+
+    /// Generate a random valid FrameType.
+    fn arb_frame_type() -> impl Strategy<Value = FrameType> {
+        prop_oneof![
+            Just(FrameType::Data),
+            Just(FrameType::Ack),
+            Just(FrameType::Syn),
+            Just(FrameType::SynAck),
+            Just(FrameType::Fin),
+            Just(FrameType::Rst),
+        ]
+    }
+
+    // **Validates: Requirements 3.1, 3.2**
+    //
+    // Property 2a: Frame decode preserves session_id.
+    // For any valid encoded frame, `decode_frame` extracts the correct session_id.
+    // This is the dispatch key the new ControlDispatcher code will use.
+    proptest! {
+        #[test]
+        fn frame_decode_preserves_session_id(
+            session_id in arb_session_id(),
+            seq in any::<u32>(),
+            frame_type in arb_frame_type(),
+            flags in any::<u8>(),
+            payload in proptest::collection::vec(any::<u8>(), 0..128),
+        ) {
+            let frame = Frame {
+                session_id: session_id.clone(),
+                seq,
+                frame_type,
+                flags: FrameFlags(flags),
+                payload,
+            };
+            let encoded = encode_frame(&frame);
+            let decoded = decode_frame(&encoded).unwrap();
+            prop_assert_eq!(decoded.session_id, session_id);
+        }
+    }
+
+    // **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5**
+    //
+    // Property 2b: Frame encode/decode round-trip preserves all fields.
+    // For any valid frame with random session_id, seq, frame_type, flags, and
+    // payload, encode then decode produces an identical frame.
+    proptest! {
+        #[test]
+        fn frame_encode_decode_round_trip_preserves_all_fields(
+            session_id in arb_session_id(),
+            seq in any::<u32>(),
+            frame_type in arb_frame_type(),
+            flags in any::<u8>(),
+            payload in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let original = Frame {
+                session_id: session_id.clone(),
+                seq,
+                frame_type,
+                flags: FrameFlags(flags),
+                payload: payload.clone(),
+            };
+            let encoded = encode_frame(&original);
+            let decoded = decode_frame(&encoded).unwrap();
+            prop_assert_eq!(&decoded.session_id, &original.session_id);
+            prop_assert_eq!(decoded.seq, original.seq);
+            prop_assert_eq!(decoded.frame_type, original.frame_type);
+            prop_assert_eq!(&decoded.flags, &original.flags);
+            prop_assert_eq!(&decoded.payload, &original.payload);
+        }
+    }
+
+    // **Validates: Requirements 3.1, 3.2**
+    //
+    // Property 2c: decode_frame correctly extracts session_id from first 9 bytes.
+    // For any valid frame, the session_id in bytes 1..9 of the encoded output
+    // matches the original session_id, confirming the wire format the dispatcher
+    // will rely on.
+    proptest! {
+        #[test]
+        fn decode_frame_extracts_session_id_from_first_9_bytes(
+            session_id in arb_session_id(),
+            seq in any::<u32>(),
+            frame_type in arb_frame_type(),
+            payload in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let frame = Frame {
+                session_id: session_id.clone(),
+                seq,
+                frame_type,
+                flags: FrameFlags::empty(),
+                payload,
+            };
+            let encoded = encode_frame(&frame);
+
+            // Verify wire format: byte 0 is session_id_len (always 8),
+            // bytes 1..9 are the raw session_id bytes.
+            prop_assert_eq!(encoded[0], 8u8);
+            prop_assert_eq!(&encoded[1..9], &session_id.0[..]);
+
+            // And decode_frame agrees.
+            let decoded = decode_frame(&encoded).unwrap();
+            prop_assert_eq!(&decoded.session_id.0[..], &encoded[1..9]);
+        }
+    }
 }

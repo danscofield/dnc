@@ -19,7 +19,8 @@ use dns_socks_proxy::frame::{
 use dns_socks_proxy::session::{Session, SessionManager, SessionState};
 use dns_socks_proxy::socks::{ConnectRequest, TargetAddr};
 use dns_socks_proxy::transport::{
-    compute_payload_budget, DirectTransport, DnsTransport, TransportBackend,
+    compute_payload_budget, recv_frames_parallel, AdaptiveBackoff, DirectTransport, DnsTransport,
+    TransportBackend,
 };
 
 /// Nonce length used in DNS queries.
@@ -118,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(control_channel = %control_channel, "polling for SYN frames");
 
     // Adaptive polling state for the control channel.
-    let mut idle_count: u32 = 0;
+    let mut backoff = AdaptiveBackoff::new(shared_config.poll_active, shared_config.backoff_max);
 
     // Set up shutdown signal handling (SIGINT / SIGTERM).
     let shutdown_signal = async {
@@ -143,22 +144,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::pin!(shutdown_signal);
 
     loop {
-        let poll_interval = if idle_count > 5 {
-            shared_config.poll_idle
-        } else {
-            shared_config.poll_active
-        };
-
         tokio::select! {
             _ = &mut shutdown_signal => {
                 break;
             }
-            _ = tokio::time::sleep(poll_interval) => {}
+            _ = tokio::time::sleep(backoff.current()) => {}
         }
 
         match transport.recv_frame(&control_channel).await {
             Ok(Some(data)) => {
-                idle_count = 0;
+                backoff.reset();
 
                 // Need at least 16 bytes for MAC at the end.
                 if data.len() < 16 {
@@ -225,11 +220,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Ok(None) => {
-                idle_count = idle_count.saturating_add(1);
+                backoff.increase();
             }
             Err(e) => {
                 debug!(error = %e, "transport error polling control channel");
-                idle_count = idle_count.saturating_add(1);
+                backoff.increase();
             }
         }
     }
@@ -522,6 +517,9 @@ async fn handle_syn(
 
 /// Upstream task (exit node): polls upstream channel for DATA frames from the client,
 /// decrypts them, reassembles, and writes to the target TCP socket.
+///
+/// Uses adaptive backoff + status query + parallel fetch (same pattern as
+/// socks-client's downstream_task).
 async fn upstream_task(
     mut tcp_write: tokio::net::tcp::OwnedWriteHalf,
     transport: Arc<dyn TransportBackend>,
@@ -536,16 +534,10 @@ async fn upstream_task(
         data_key,
         control_key: [0u8; 32],
     };
-    let mut idle_count: u32 = 0;
+    let mut backoff = AdaptiveBackoff::new(config.poll_active, config.backoff_max);
+    let query_timeout = Duration::from_secs(2);
 
     loop {
-        let poll_interval = if idle_count > 5 {
-            config.poll_idle
-        } else {
-            config.poll_active
-        };
-        tokio::time::sleep(poll_interval).await;
-
         // Check session is still alive.
         {
             let mgr = session_manager.lock().await;
@@ -561,15 +553,61 @@ async fn upstream_task(
             }
         }
 
-        match transport.recv_frames(&upstream_channel).await {
-            Ok(frames) if frames.is_empty() => {
-                idle_count = idle_count.saturating_add(1);
-                if idle_count % 100 == 1 {
-                    debug!(session_id = %session_id, channel = %upstream_channel, "upstream poll: empty");
+        // Phase 1: Query status to determine queue depth.
+        let frames_result = match transport.query_status(&upstream_channel).await {
+            Ok(0) => {
+                // No data available — increase backoff and sleep.
+                backoff.increase();
+                tokio::time::sleep(backoff.current()).await;
+                continue;
+            }
+            Ok(depth) => {
+                // Data available — reset backoff and fire parallel queries.
+                backoff.reset();
+                let count = depth.min(config.max_parallel_queries);
+                // Parallel recv only makes sense for DnsTransport (standalone mode).
+                // For DirectTransport (embedded), resolver_addr is None; fall back to recv_frames.
+                match config.resolver_addr {
+                    Some(resolver_addr) => {
+                        let parallel_frames = recv_frames_parallel(
+                            resolver_addr,
+                            &config.controlled_domain,
+                            &upstream_channel,
+                            count,
+                            query_timeout,
+                        )
+                        .await;
+                        Ok(parallel_frames)
+                    }
+                    None => {
+                        // Embedded mode — DirectTransport already drains multiple messages.
+                        match transport.recv_frames(&upstream_channel).await {
+                            Ok(frames) => Ok(frames),
+                            Err(e) => Err(e),
+                        }
+                    }
                 }
             }
+            Err(e) => {
+                // Status query failed — fall back to single recv_frames call.
+                debug!(error = %e, "status query failed, falling back to single recv_frames");
+                match transport.recv_frames(&upstream_channel).await {
+                    Ok(frames) => Ok(frames),
+                    Err(e2) => Err(e2),
+                }
+            }
+        };
+
+        // Phase 2: Process received frames through the decryption/reassembly/ACK pipeline.
+        match frames_result {
+            Ok(frames) if frames.is_empty() => {
+                // No frames received — increase backoff and sleep.
+                backoff.increase();
+                tokio::time::sleep(backoff.current()).await;
+            }
             Ok(frames) => {
-                idle_count = 0;
+                // Data received — reset backoff; will immediately re-poll (no sleep).
+                backoff.reset();
                 debug!(session_id = %session_id, count = frames.len(), "upstream poll: got frames");
                 for data in frames {
 
@@ -695,7 +733,8 @@ async fn upstream_task(
             }
             Err(e) => {
                 debug!(error = %e, "transport error polling upstream");
-                idle_count = idle_count.saturating_add(1);
+                backoff.increase();
+                tokio::time::sleep(backoff.current()).await;
             }
         }
     }
