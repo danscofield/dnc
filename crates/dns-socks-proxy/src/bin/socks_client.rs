@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use dns_socks_proxy::config::{SocksClientCli, SocksClientConfig};
@@ -192,6 +192,57 @@ fn spawn_control_poller(
     });
 }
 
+// ---------------------------------------------------------------------------
+// acquire_permit — concurrency limiter gate
+// ---------------------------------------------------------------------------
+
+/// Attempt to acquire a semaphore permit for a new connection.
+///
+/// Three cases:
+/// 1. Permit available immediately → return it.
+/// 2. All permits in use, `queue_timeout > 0` → wait up to `queue_timeout`.
+/// 3. All permits in use, `queue_timeout == 0` → reject immediately.
+async fn acquire_permit(
+    semaphore: &Arc<Semaphore>,
+    queue_timeout: Duration,
+    peer_addr: std::net::SocketAddr,
+) -> Option<OwnedSemaphorePermit> {
+    // Fast path: try to acquire without waiting.
+    match semaphore.clone().try_acquire_owned() {
+        Ok(permit) => return Some(permit),
+        Err(_) => {
+            // All permits in use — fall through to queuing logic.
+        }
+    }
+
+    // Zero timeout means immediate rejection.
+    if queue_timeout == Duration::ZERO {
+        warn!(%peer_addr, timeout_ms = 0u64, "connection dropped, queue timeout exceeded");
+        return None;
+    }
+
+    // Non-zero timeout: queue the connection and wait.
+    info!(%peer_addr, "connection queued, all permits in use");
+    let wait_start = Instant::now();
+
+    match tokio::time::timeout(queue_timeout, semaphore.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => {
+            info!(%peer_addr, wait_ms = wait_start.elapsed().as_millis() as u64, "queued connection dequeued");
+            Some(permit)
+        }
+        Ok(Err(_)) => {
+            // Semaphore closed — should never happen.
+            warn!(%peer_addr, "semaphore closed unexpectedly");
+            None
+        }
+        Err(_) => {
+            // Timeout expired.
+            warn!(%peer_addr, timeout_ms = queue_timeout.as_millis() as u64, "connection dropped, queue timeout exceeded");
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing.
@@ -213,6 +264,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "socks-client starting"
     );
 
+    info!(
+        max_concurrent_sessions = config.max_concurrent_sessions,
+        queue_timeout_ms = config.queue_timeout.as_millis() as u64,
+        "concurrency limiter configured"
+    );
+
     // Bind TCP listener.
     let listen_addr = format!("{}:{}", config.listen_addr, config.listen_port);
     let listener = TcpListener::bind(&listen_addr).await?;
@@ -223,6 +280,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Shared config values wrapped in Arc for spawned tasks.
     let shared_config = Arc::new(config);
+
+    // Create the concurrency-limiting semaphore.
+    let semaphore = Arc::new(Semaphore::new(shared_config.max_concurrent_sessions));
 
     // Create the control channel dispatcher (demuxes control frames to per-session channels).
     let dispatcher = Arc::new(ControlDispatcher::new());
@@ -250,11 +310,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, peer_addr) = listener.accept().await?;
         info!(%peer_addr, "accepted connection");
 
+        let permit = acquire_permit(&semaphore, shared_config.queue_timeout, peer_addr).await;
+        let permit = match permit {
+            Some(p) => p,
+            None => continue, // timed out or rejected; stream dropped (closed)
+        };
+
         let session_manager = Arc::clone(&session_manager);
         let config = Arc::clone(&shared_config);
         let dispatcher = Arc::clone(&dispatcher);
 
         tokio::spawn(async move {
+            let _permit = permit; // held until task ends
             if let Err(e) = handle_connection(stream, session_manager, config, dispatcher).await {
                 warn!(%peer_addr, error = %e, "session failed");
             }

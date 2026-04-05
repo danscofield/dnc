@@ -29,6 +29,9 @@ pub enum ConfigError {
     #[error("exactly one of --psk or --psk-file must be provided")]
     PskNotProvided,
 
+    #[error("--max-concurrent-sessions must be >= 1, got {got}")]
+    InvalidMaxConcurrentSessions { got: usize },
+
     #[error("PSK validation failed: {0}")]
     PskValidation(#[from] crate::crypto::CryptoError),
 }
@@ -115,6 +118,15 @@ pub struct SocksClientCli {
     /// Maximum backoff interval in milliseconds (default: value of poll_idle_ms).
     #[arg(long)]
     pub backoff_max_ms: Option<u64>,
+
+    /// Maximum number of concurrent active sessions (default: 8).
+    #[arg(long, default_value_t = 8)]
+    pub max_concurrent_sessions: usize,
+
+    /// Queue timeout in milliseconds for waiting connections (default: 30000).
+    /// Set to 0 to reject immediately when all permits are in use.
+    #[arg(long, default_value_t = 30000)]
+    pub queue_timeout_ms: u64,
 }
 
 /// Validated configuration for the socks-client binary.
@@ -149,11 +161,21 @@ pub struct SocksClientConfig {
     pub max_parallel_queries: usize,
     /// Maximum backoff interval (defaults to poll_idle).
     pub backoff_max: Duration,
+    /// Maximum number of concurrent active sessions.
+    pub max_concurrent_sessions: usize,
+    /// Queue timeout for waiting connections.
+    pub queue_timeout: Duration,
 }
 
 impl SocksClientCli {
     /// Parse CLI arguments and validate into a `SocksClientConfig`.
     pub fn into_config(self) -> Result<SocksClientConfig, ConfigError> {
+        if self.max_concurrent_sessions < 1 {
+            return Err(ConfigError::InvalidMaxConcurrentSessions {
+                got: self.max_concurrent_sessions,
+            });
+        }
+
         let psk = resolve_psk(self.psk.as_deref(), self.psk_file.as_deref())?;
         let poll_idle = Duration::from_millis(self.poll_idle_ms);
         let backoff_max = match self.backoff_max_ms {
@@ -177,6 +199,8 @@ impl SocksClientCli {
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
             max_parallel_queries: self.max_parallel_queries.max(1),
             backoff_max,
+            max_concurrent_sessions: self.max_concurrent_sessions,
+            queue_timeout: Duration::from_millis(self.queue_timeout_ms),
         })
     }
 }
@@ -447,6 +471,8 @@ mod tests {
             connect_timeout_ms: 30000,
             max_parallel_queries: 8,
             backoff_max_ms: None,
+            max_concurrent_sessions: 8,
+            queue_timeout_ms: 30000,
         }
     }
 
@@ -539,6 +565,34 @@ mod tests {
         cli.psk = None;
         cli.psk_file = None;
         assert!(cli.into_config().is_err());
+    }
+
+    // --- Concurrency config ---
+
+    #[test]
+    fn socks_client_concurrency_defaults() {
+        let cfg = base_socks_cli().into_config().unwrap();
+        assert_eq!(cfg.max_concurrent_sessions, 8);
+        assert_eq!(cfg.queue_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn socks_client_zero_max_concurrent_sessions_rejected() {
+        let mut cli = base_socks_cli();
+        cli.max_concurrent_sessions = 0;
+        let result = cli.into_config();
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidMaxConcurrentSessions { got: 0 })
+        ));
+    }
+
+    #[test]
+    fn socks_client_zero_queue_timeout_produces_duration_zero() {
+        let mut cli = base_socks_cli();
+        cli.queue_timeout_ms = 0;
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.queue_timeout, Duration::ZERO);
     }
 
     // --- DeploymentMode ---
