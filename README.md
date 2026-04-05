@@ -1,0 +1,186 @@
+# dns-tunnel
+
+Tunnel TCP traffic through DNS queries using a SOCKS5 interface.
+
+The system has three components:
+
+- **dns-message-broker** — A DNS server that acts as a per-channel FIFO message store. Clients send data by encoding it in DNS A query names; receivers poll with TXT queries. Can be used standalone as a simple DNS-based messaging channel without the SOCKS tunnel.
+- **dnc** — A netcat-style CLI for sending and receiving messages through the broker directly. Useful for testing, scripting, or simple data exfiltration without the full tunnel stack.
+- **socks-client** — Runs on your workstation. Exposes a standard SOCKS5 proxy on localhost. Applications (browsers, curl, etc.) connect to it normally. Traffic is fragmented, encrypted, and tunneled through DNS.
+- **exit-node** — Runs on a server. Receives tunneled requests via the broker, makes the actual TCP connections, and returns responses over DNS. Can run the broker in-process (embedded mode) or talk to a separate broker over DNS (standalone mode).
+
+## How it works
+
+```
+Application → SOCKS5 → socks-client → DNS A queries → Broker → exit-node → Target
+                                    ← DNS TXT responses ←
+```
+
+Data is split into ~105-byte frames, encrypted with ChaCha20-Poly1305 (per-session keys via X25519 + PSK), and encoded as DNS queries. The broker is a simple store-and-forward relay — all tunnel logic (sessions, reliability, encryption) lives in the two endpoints.
+
+## Quick start
+
+### 1. Generate a PSK
+
+```bash
+head -c 32 /dev/urandom > psk.key
+```
+
+Both sides need the same key.
+
+### 2. Run the exit-node (server side)
+
+Create a broker config (`broker.toml`):
+
+```toml
+controlled_domain = "tunnel.example.com"
+listen_addr = "0.0.0.0"
+listen_port = 53
+```
+
+Run in embedded mode (broker + exit-node in one process):
+
+```bash
+./exit-node \
+  --domain tunnel.example.com \
+  --node-id e1 \
+  --mode embedded \
+  --broker-config broker.toml \
+  --psk-file psk.key
+```
+
+### 3. Point your DNS
+
+Add an NS record for `tunnel.example.com` pointing to your server's IP.
+
+### 4. Run the socks-client (workstation side)
+
+Direct to broker:
+
+```bash
+./socks-client \
+  --domain tunnel.example.com \
+  --resolver <server-ip>:53 \
+  --client-id c1 \
+  --exit-node-id e1 \
+  --psk-file psk.key
+```
+
+Through a recursive resolver:
+
+```bash
+./socks-client \
+  --domain tunnel.example.com \
+  --resolver 1.1.1.1:53 \
+  --client-id c1 \
+  --exit-node-id e1 \
+  --psk-file psk.key
+```
+
+### 5. Use it
+
+```bash
+curl -x socks5h://127.0.0.1:1080 http://icanhazip.com
+```
+
+Or configure Firefox: Settings → Network → SOCKS5 proxy → `127.0.0.1:1080`, check "Proxy DNS when using SOCKS v5".
+
+## Building
+
+```bash
+make build          # build all binaries (release)
+make test           # run all tests
+make dist           # cross-compile for linux-x64, linux-arm64, macos-arm64
+```
+
+Requires [zig](https://ziglang.org/) and [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) for cross-compilation.
+
+## Architecture
+
+```
+crates/
+  dns-socks-proxy/        # SOCKS tunnel (socks-client + exit-node binaries)
+    src/
+      frame.rs            # Binary frame protocol (15-byte header, encode/decode)
+      crypto.rs           # X25519 key exchange, ChaCha20-Poly1305, HMAC-SHA256
+      reliability.rs      # Retransmit buffer, reassembly buffer, sliding window
+      transport.rs        # TransportBackend trait, DnsTransport, DirectTransport
+      session.rs          # Session manager, state machine
+      socks.rs            # SOCKS5 handshake and CONNECT parsing
+      config.rs           # CLI argument parsing for both binaries
+      bin/
+        socks_client.rs   # SOCKS5 proxy client binary
+        exit_node.rs      # Exit node binary (standalone or embedded)
+src/                      # DNS Message Broker
+  server.rs               # UDP DNS server loop
+  handler.rs              # Query routing (send via A, receive via TXT)
+  store.rs                # Per-channel FIFO message store
+  encoding.rs             # Base32 encoding, envelope format
+  dns.rs                  # DNS packet building/parsing
+  config.rs               # Broker TOML configuration
+examples/
+  dnc.rs                  # DNS netcat — CLI tool for sending/receiving messages
+```
+
+## Performance
+
+Direct to broker: ~3 seconds for a simple HTTP request (SYN + request + response).
+
+Through recursive resolver: slower due to extra DNS hops, but functional.
+
+Each DNS message carries ~105 bytes of payload. The tunnel uses EDNS0 to batch multiple frames per TXT response (up to ~1232 bytes), reducing polling overhead.
+
+## Security
+
+- Per-session encryption: X25519 ephemeral key exchange authenticated by a pre-shared key
+- DATA frames encrypted with ChaCha20-Poly1305
+- Control frames (SYN/SYN-ACK/FIN/RST/ACK) authenticated with HMAC-SHA256
+- PSK must be at least 32 bytes
+
+## CLI reference
+
+### socks-client
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--domain` | required | Controlled DNS domain |
+| `--resolver` | required | DNS resolver address (e.g. `1.1.1.1:53`) |
+| `--client-id` | required | Client identifier |
+| `--exit-node-id` | required | Exit node identifier |
+| `--psk-file` | — | Path to PSK file (32+ bytes) |
+| `--psk` | — | PSK as hex string |
+| `--listen-addr` | `127.0.0.1` | Listen address |
+| `--listen-port` | `1080` | Listen port |
+| `--rto-ms` | `2000` | Retransmission timeout (ms) |
+| `--window-size` | `8` | Sliding window size |
+| `--poll-active-ms` | `50` | Active poll interval (ms) |
+| `--poll-idle-ms` | `500` | Idle poll interval (ms) |
+
+### exit-node
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--domain` | required | Controlled DNS domain |
+| `--node-id` | required | Node identifier |
+| `--mode` | `standalone` | `standalone` or `embedded` |
+| `--broker-config` | — | Broker TOML config (embedded mode) |
+| `--resolver` | — | DNS resolver (standalone mode) |
+| `--psk-file` | — | Path to PSK file |
+| `--psk` | — | PSK as hex string |
+| `--rto-ms` | `2000` | Retransmission timeout (ms) |
+| `--connect-timeout-ms` | `10000` | TCP connect timeout (ms) |
+
+### dnc (DNS netcat)
+
+A standalone tool for sending/receiving messages through the broker's channels directly (not through the SOCKS tunnel).
+
+```bash
+echo "hello" | dnc -d tunnel.example.com general              # send to channel "general"
+echo "hello" | dnc -d tunnel.example.com -s alice general      # send with sender ID
+dnc -d tunnel.example.com -l general                           # listen on channel
+dnc -d tunnel.example.com -l -1 general                        # receive one message and exit
+```
+
+## License
+
+MIT

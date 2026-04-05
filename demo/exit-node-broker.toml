@@ -1,0 +1,12 @@
+# Broker config for embedded mode exit-node.
+# The exit-node runs this broker in-process and also serves DNS queries
+# from external socks-clients on this address.
+
+controlled_domain = "x.y.z"
+listen_addr = "0.0.0.0"
+listen_port = 5353
+max_messages_per_channel = 100
+message_ttl_secs = 600
+channel_inactivity_timeout_secs = 3600
+expiry_interval_secs = 30
+log_level = "info"

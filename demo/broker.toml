@@ -1,0 +1,10 @@
+# Demo configuration for the DNS Message Broker.
+# Uses a high port so you don't need root/sudo.
+
+controlled_domain = "broker.example.com"
+listen_addr = "127.0.0.1"
+listen_port = 15353
+log_level = "debug"
+max_messages_per_channel = 100
+message_ttl_secs = 300
+channel_inactivity_timeout_secs = 600
