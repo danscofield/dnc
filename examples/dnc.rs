@@ -371,7 +371,6 @@ async fn stream_recv(
                 if !got_first {
                     return Ok(false);
                 }
-                // We've started receiving but channel is empty — back off and retry
                 interval = (interval * 2).min(max_interval);
             }
         }
