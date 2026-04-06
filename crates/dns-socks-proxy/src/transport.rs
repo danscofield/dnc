@@ -610,11 +610,12 @@ impl TransportBackend for DirectTransport {
 
     async fn recv_frames(&self, channel: &str) -> Result<Vec<Vec<u8>>, TransportError> {
         let mut store = self.store.write().await;
-        // DirectTransport uses pop_many (destructive) because it operates
-        // in-process — there is no network loss between the store and the
-        // consumer. The replay window (peek_many) is only needed for the
-        // DNS/UDP path where responses can be silently lost.
-        let msgs = store.pop_many(channel, 10);
+        // Use peek_many (non-destructive with replay) even in embedded mode.
+        // Although there's no network loss between the store and the exit node,
+        // the client polls through a recursive resolver where UDP responses
+        // can be lost. The broker needs the replay buffer to re-deliver data
+        // that the client never received.
+        let msgs = store.peek_many(channel, 10);
         Ok(msgs.into_iter().map(|msg| msg.payload).collect())
     }
 
