@@ -40,6 +40,14 @@ To receive messages, the client sends a DNS TXT query:
 <nonce>.<channel>.<controlled_domain>
 ```
 
+The default behavior is non-destructive (peek with replay buffer). To consume messages destructively (pop), prefix the nonce with `p`:
+
+```
+p<nonce>.<channel>.<controlled_domain>
+```
+
+The SOCKS tunnel uses peek semantics for reliability over lossy UDP. The `dnc` tool uses pop semantics so messages are consumed on read.
+
 The broker returns pending messages as TXT records. Each TXT record contains an envelope string:
 
 ```
@@ -224,3 +232,27 @@ The exit node supports two deployment modes:
 | Embedded | `DirectTransport` | Runs the broker in-process, calls the store directly |
 
 `DirectTransport` uses destructive reads (`pop_many`) since there's no network loss between the store and consumer. `DnsTransport` uses non-destructive reads (`peek_many` with replay) to handle UDP packet loss.
+
+## dnc Stream Framing
+
+`dnc` adds a lightweight stream framing layer on top of the base messaging layer for transferring data larger than a single DNS message.
+
+### Stream Frame Header
+
+Each message payload is prefixed with a 4-byte header:
+
+```
+Offset  Size  Field
+0       1     seq_hi (big-endian, high byte of 16-bit sequence)
+1       1     seq_lo (big-endian, low byte of 16-bit sequence)
+2       1     flags (0x00 = DATA, 0x01 = EOF)
+3       1     reserved (0x00)
+```
+
+### Behavior
+
+- Small messages that fit in a single DNS query are sent as a single frame with `seq=0` and `flags=EOF`
+- Large inputs are chunked into multiple frames with incrementing sequence numbers; the last frame has `flags=EOF`
+- The receiver reassembles frames in sequence order and outputs data as contiguous frames arrive
+- Maximum stream size: 65535 frames × ~124 bytes/frame ≈ 8MB
+- `dnc` uses pop semantics (nonce prefix `p`) so each frame is consumed on read

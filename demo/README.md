@@ -19,22 +19,24 @@ Send mode (default) — reads from stdin:
 ```bash
 echo "hello" | dnc general
 echo "secret" | dnc -s alice inbox
-cat file.txt | dnc -s bob uploads
+cat file.txt | dnc -s bob uploads      # auto-chunked for large inputs
 ```
 
 Listen mode — prints messages to stdout:
 ```bash
 dnc -l general              # poll continuously
-dnc -l -1 general           # receive one message and exit
+dnc -l -1 general           # receive one stream and exit
+dnc -l -1 general > out.txt # receive to file
 ```
 
 Options:
 ```
 -l          Listen mode (receive)
--1          Receive one message and exit
+-1          Receive one complete stream and exit
 -s NAME     Sender ID (default: "anon")
 -b ADDR     Broker address (default: system resolver, or 1.1.1.1:53)
 -d DOMAIN   Controlled domain (default: broker.example.com)
+-v          Verbose output on stderr
 ```
 
 ## Manual usage

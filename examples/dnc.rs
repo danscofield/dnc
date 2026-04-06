@@ -75,6 +75,10 @@ struct Cli {
     #[arg(short = 'd', long, default_value = "broker.example.com")]
     domain: String,
 
+    /// Verbose output on stderr
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
     /// Channel name
     channel: String,
 }
@@ -268,6 +272,7 @@ async fn stream_send(
     sender: &str,
     channel: &str,
     domain: &str,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let max_raw = max_payload_size(sender, channel, domain);
     if max_raw <= STREAM_HEADER_SIZE {
@@ -292,7 +297,7 @@ async fn stream_send(
         .into());
     }
 
-    if total > 1 {
+    if total > 1 && verbose {
         eprintln!(
             "dnc: streaming {} bytes in {} frames ({} bytes/frame)",
             data.len(),
@@ -402,7 +407,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = if resolver.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
     let socket = UdpSocket::bind(bind_addr).await?;
 
-    eprintln!("dnc: using resolver {}", resolver);
+    let verbose = cli.verbose;
+    if verbose {
+        eprintln!("dnc: using resolver {}", resolver);
+    }
 
     if cli.listen {
         let min_interval = std::time::Duration::from_millis(50);
@@ -431,7 +439,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let stdin = io::stdin();
         if atty::is(atty::Stream::Stdin) {
             // Interactive: each line is its own stream
-            eprintln!("dnc: reading from stdin (Ctrl+D to finish)");
+            if verbose {
+                eprintln!("dnc: reading from stdin (Ctrl+D to finish)");
+            }
             for line in stdin.lock().lines() {
                 let line = line?;
                 if line.is_empty() {
@@ -444,6 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &cli.sender,
                     &cli.channel,
                     &cli.domain,
+                    verbose,
                 )
                 .await?;
             }
@@ -462,6 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &cli.sender,
                     &cli.channel,
                     &cli.domain,
+                    verbose,
                 )
                 .await?;
             }

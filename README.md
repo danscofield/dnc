@@ -191,14 +191,25 @@ Each DNS message carries ~104 bytes of payload. The tunnel uses EDNS0 to batch m
 
 ### dnc (DNS netcat)
 
-A standalone tool for sending/receiving messages through the broker's channels directly (not through the SOCKS tunnel).
+A standalone tool for sending/receiving messages through the broker's channels directly (not through the SOCKS tunnel). Large inputs are automatically chunked into a stream of DNS messages and reassembled on the receiving end.
 
 ```bash
 echo "hello" | dnc -d tunnel.example.com general              # send to channel "general"
 echo "hello" | dnc -d tunnel.example.com -s alice general      # send with sender ID
+cat bigfile.txt | dnc -d tunnel.example.com -s bob inbox       # auto-chunked stream
 dnc -d tunnel.example.com -l general                           # listen on channel
-dnc -d tunnel.example.com -l -1 general                        # receive one message and exit
+dnc -d tunnel.example.com -l -1 general                        # receive one stream and exit
+dnc -d tunnel.example.com -l -1 general > output.txt           # receive to file
 ```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-l` | — | Listen mode (receive) |
+| `-1` | — | Receive one complete stream and exit |
+| `-s` | `anon` | Sender ID |
+| `-b` | system resolver | Broker address (e.g. `127.0.0.1:5353`) |
+| `-d` | `broker.example.com` | Controlled domain |
+| `-v` | — | Verbose output on stderr |
 
 ## License
 
