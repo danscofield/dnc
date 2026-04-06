@@ -352,8 +352,12 @@ fn handle_receive<C: Clock>(
         .unwrap_or_default();
     }
 
-    // The channel is the remaining label(s) — for receive, it should be exactly 1 label
+    // The channel is the remaining label(s) — for receive, it should be exactly 1 label.
+    // Pop mode: if the nonce starts with 'p', use destructive pop_many instead of peek_many.
+    // This allows simple consumers (like dnc) to get consume-once semantics.
     let channel = &after_nonce[0];
+    let nonce_label = &remaining[0];
+    let use_pop = nonce_label.starts_with('p') || nonce_label.starts_with('P');
 
     // Determine how many messages to pop based on EDNS0 buffer size.
     // Each TXT record envelope is roughly 200-300 bytes in the wire response.
@@ -365,7 +369,11 @@ fn handle_receive<C: Clock>(
         1
     };
 
-    let messages = store.peek_many(channel, max_messages);
+    let messages = if use_pop {
+        store.pop_many(channel, max_messages)
+    } else {
+        store.peek_many(channel, max_messages)
+    };
     if messages.is_empty() {
         // No messages — NOERROR with zero answers
         return build_response(

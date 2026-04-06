@@ -213,7 +213,7 @@ async fn dns_recv_raw(
     channel: &str,
     domain: &str,
 ) -> Result<Option<EnvelopeParts>, Box<dyn std::error::Error>> {
-    let name_str = format!("{}.{}.{}.", nonce(), channel, domain);
+    let name_str = format!("p{}.{}.{}.", nonce(), channel, domain);
     let name = Name::from_ascii(&name_str)?;
 
     let mut msg = Message::new();
