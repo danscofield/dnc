@@ -40,6 +40,14 @@ To receive messages, the client sends a DNS TXT query:
 <nonce>.<channel>.<controlled_domain>
 ```
 
+The nonce can optionally include a cursor suffix for replay advancement:
+
+```
+<random>-c<cursor>.<channel>.<controlled_domain>
+```
+
+When a cursor is present, the broker prunes replay entries with `sequence < cursor` before building the response. This allows clients to acknowledge received frames and prevent stale re-delivery.
+
 The default behavior is non-destructive (peek with replay buffer). To consume messages destructively (pop), prefix the nonce with uppercase `P`:
 
 ```
@@ -58,7 +66,7 @@ The broker returns pending messages as TXT records. Each TXT record contains an 
 - `timestamp` — Unix epoch seconds when stored
 - `base32_payload` — RFC 4648 base32, lowercase, no padding
 
-If EDNS0 is present with a UDP buffer ≥1232 bytes, the broker batches multiple messages into a single response. Without EDNS0, one message per response.
+If EDNS0 is present with a UDP buffer ≥1232 bytes, the broker batches up to 2 messages into a single response (capped to keep responses under ~600 bytes, avoiding drops by recursive resolvers). Without EDNS0, one message per response.
 
 ### Status (A query)
 
@@ -77,7 +85,11 @@ Response is an A record encoding the depth:
 
 ### Replay Buffer
 
-The broker uses non-destructive reads (`peek_many`). Served messages move to a per-channel replay buffer so they can be re-delivered if the UDP response is lost. The replay clears when:
+The broker uses non-destructive reads (`peek_many`). Served messages move to a per-channel replay buffer so they can be re-delivered if the UDP response is lost.
+
+**Cursor-based replay advancement:** The SOCKS tunnel client tracks the highest store sequence number received from broker responses. On subsequent polls, it encodes this as a cursor in the TXT query nonce (`<random>-c<cursor>`). The broker parses the cursor and prunes replay entries with `sequence < cursor`, retaining only unconfirmed frames for re-delivery. This eliminates the guessing heuristic that previously caused permanent data loss when UDP responses were dropped by recursive resolvers.
+
+**Legacy (no cursor):** When no `-c` suffix is present in the nonce (e.g., `dnc` or older clients), the broker falls back to heuristic replay clearing:
 
 - New messages arrive in the queue (stale replay is discarded, only new messages served)
 - The queue is empty on re-poll (replay returned one final time, then cleared)
@@ -231,7 +243,7 @@ The exit node supports two deployment modes:
 | Standalone | `DnsTransport` | Talks to a separate broker over DNS |
 | Embedded | `DirectTransport` | Runs the broker in-process, calls the store directly |
 
-`DirectTransport` uses destructive reads (`pop_many`) since there's no network loss between the store and consumer. `DnsTransport` uses non-destructive reads (`peek_many` with replay) to handle UDP packet loss.
+`DirectTransport` uses non-destructive reads (`peek_many` with replay) since the client polls through a recursive resolver where UDP responses can be lost. `DnsTransport` also uses non-destructive reads with replay. Both transports support cursor-based replay advancement — the client tracks the highest store sequence from broker responses and passes `max_store_seq + 1` as the cursor on subsequent polls to prune confirmed replay entries.
 
 ## dnc Stream Framing
 

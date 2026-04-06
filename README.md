@@ -134,7 +134,7 @@ Direct to broker: ~3 seconds for a simple HTTP request (SYN + request + response
 
 Through recursive resolver: slower due to extra DNS hops, but functional.
 
-Each DNS message carries ~104 bytes of payload. The tunnel uses EDNS0 to batch multiple frames per TXT response (up to ~1232 bytes), reducing polling overhead.
+Each DNS message carries ~104 bytes of payload. The tunnel uses EDNS0 to batch up to 2 frames per TXT response (~600 bytes max), keeping responses small enough to survive recursive resolvers that drop oversized UDP packets. Cursor-based replay advancement ensures frames are re-delivered when DNS responses are lost, eliminating the previous heuristic that could permanently lose data.
 
 ## Security
 

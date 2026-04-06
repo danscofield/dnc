@@ -371,9 +371,11 @@ fn handle_receive<C: Clock>(
     // Determine how many messages to pop based on EDNS0 buffer size.
     // Each TXT record envelope is roughly 200-300 bytes in the wire response.
     // With EDNS0, we can fit multiple records. Without EDNS0, stick to 1.
+    // Cap at 2 to keep responses under ~600 bytes — larger UDP responses
+    // are frequently dropped by recursive resolvers (e.g., Cloudflare).
     let max_messages = if query.edns_udp_size >= 1232 {
-        // Conservative: ~250 bytes per TXT record in wire format
-        ((query.edns_udp_size as usize).saturating_sub(100) / 250).max(1)
+        // Conservative: ~250 bytes per TXT record in wire format, cap at 2
+        ((query.edns_udp_size as usize).saturating_sub(100) / 250).max(1).min(2)
     } else {
         1
     };
