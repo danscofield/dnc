@@ -117,12 +117,16 @@ pub trait TransportBackend: Send + Sync {
     ) -> Result<(), TransportError>;
 
     /// Receive the next frame(s) from the specified channel.
-    /// Returns an empty vec if the channel is empty.
-    async fn recv_frames(&self, channel: &str) -> Result<Vec<Vec<u8>>, TransportError>;
+    /// Returns `(frames, max_store_seq)` where `max_store_seq` is the highest
+    /// store sequence number seen across all returned envelopes (used for
+    /// cursor-based replay advancement). Returns `None` if no frames.
+    /// When `cursor` is `Some`, the query nonce includes a cursor suffix for
+    /// cursor-based replay advancement.
+    async fn recv_frames(&self, channel: &str, cursor: Option<u64>) -> Result<(Vec<Vec<u8>>, Option<u64>), TransportError>;
 
     /// Convenience: receive a single frame (pops the first from a batch).
-    async fn recv_frame(&self, channel: &str) -> Result<Option<Vec<u8>>, TransportError> {
-        let mut frames = self.recv_frames(channel).await?;
+    async fn recv_frame(&self, channel: &str, cursor: Option<u64>) -> Result<Option<Vec<u8>>, TransportError> {
+        let (mut frames, _seq) = self.recv_frames(channel, cursor).await?;
         Ok(if frames.is_empty() { None } else { Some(frames.remove(0)) })
     }
 
@@ -140,6 +144,7 @@ pub struct DnsTransport {
     channel_full_backoff: Duration,
     query_interval: Duration,
     last_query: tokio::sync::Mutex<tokio::time::Instant>,
+    use_edns: bool,
 }
 
 impl DnsTransport {
@@ -165,6 +170,7 @@ impl DnsTransport {
             channel_full_backoff: DEFAULT_CHANNEL_FULL_BACKOFF,
             query_interval: Duration::ZERO,
             last_query: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            use_edns: true,
         })
     }
 
@@ -183,6 +189,12 @@ impl DnsTransport {
     /// Set the minimum interval between DNS queries (rate limiting).
     pub fn with_query_interval(mut self, interval: Duration) -> Self {
         self.query_interval = interval;
+        self
+    }
+
+    /// Set whether to include EDNS0 OPT records on TXT queries.
+    pub fn with_edns(mut self, use_edns: bool) -> Self {
+        self.use_edns = use_edns;
         self
     }
 
@@ -214,6 +226,38 @@ impl DnsTransport {
             .collect()
     }
 
+    /// Generate a nonce with an optional cursor suffix.
+    ///
+    /// - `Some(c)` → `<8-char-random>-c<cursor_base10>` (e.g., `aB3kQ12x-c42`)
+    /// - `None`    → `<4-char-random>` (existing behavior)
+    ///
+    /// The result is guaranteed to fit within the 63-byte DNS label limit.
+    pub fn generate_nonce_with_cursor(cursor: Option<u64>) -> String {
+        match cursor {
+            None => Self::generate_nonce(),
+            Some(c) => {
+                let mut rng = rand::thread_rng();
+                let random_part: String = (0..8)
+                    .map(|_| {
+                        let idx = rng.gen_range(0..62);
+                        if idx < 10 {
+                            (b'0' + idx) as char
+                        } else if idx < 36 {
+                            (b'a' + idx - 10) as char
+                        } else {
+                            (b'A' + idx - 36) as char
+                        }
+                    })
+                    .collect();
+                let nonce = format!("{}-c{}", random_part, c);
+                // Ensure the nonce fits within the 63-byte DNS label limit.
+                // 8 (random) + 2 ("-c") + up to 20 digits (u64 max) = 30 max, well within 63.
+                debug_assert!(nonce.len() <= MAX_LABEL_LEN);
+                nonce
+            }
+        }
+    }
+
     /// Split a base32-encoded string into DNS labels of at most MAX_LABEL_LEN chars.
     fn split_into_labels(encoded: &str) -> Vec<&str> {
         if encoded.is_empty() {
@@ -227,7 +271,7 @@ impl DnsTransport {
     }
 
     /// Build a DNS query message for the given name and record type.
-    fn build_dns_query(name: &Name, record_type: RecordType) -> Result<Vec<u8>, TransportError> {
+    pub fn build_dns_query(name: &Name, record_type: RecordType, use_edns: bool) -> Result<Vec<u8>, TransportError> {
         let mut message = Message::new();
         let id: u16 = rand::thread_rng().gen();
         message.set_id(id);
@@ -236,7 +280,7 @@ impl DnsTransport {
         message.add_query(query);
 
         // Add EDNS0 OPT record for TXT queries to enable larger responses.
-        if record_type == RecordType::TXT {
+        if record_type == RecordType::TXT && use_edns {
             use hickory_proto::op::Edns;
             let mut edns = Edns::new();
             edns.set_max_payload(EDNS_UDP_SIZE);
@@ -307,8 +351,11 @@ impl DnsTransport {
     }
 
     /// Build the receive query name: `<nonce>.<channel>.<domain>`
-    fn build_recv_query_name(&self, channel: &str) -> Result<Name, TransportError> {
-        let nonce = Self::generate_nonce();
+    ///
+    /// When `cursor` is `Some`, the nonce includes a `-c<cursor>` suffix for
+    /// cursor-based replay advancement.
+    fn build_recv_query_name(&self, channel: &str, cursor: Option<u64>) -> Result<Name, TransportError> {
+        let nonce = Self::generate_nonce_with_cursor(cursor);
         let full_name = format!("{}.{}.{}.", nonce, channel, self.controlled_domain);
 
         Name::from_ascii(&full_name)
@@ -373,7 +420,7 @@ impl TransportBackend for DnsTransport {
         let encoded = dns_message_broker::encoding::base32_encode(frame_bytes);
         let query_name = self.build_send_query_name(channel, sender_id, &encoded)?;
         debug!(name_len = query_name.to_string().len(), channel, "send_frame query");
-        let query_bytes = Self::build_dns_query(&query_name, RecordType::A)?;
+        let query_bytes = Self::build_dns_query(&query_name, RecordType::A, self.use_edns)?;
 
         for _retry in 0..MAX_CHANNEL_FULL_RETRIES {
             let response_bytes = self.send_dns_query(&query_bytes).await?;
@@ -403,31 +450,35 @@ impl TransportBackend for DnsTransport {
         Err(TransportError::ChannelFull)
     }
 
-    async fn recv_frames(&self, channel: &str) -> Result<Vec<Vec<u8>>, TransportError> {
-        let query_name = self.build_recv_query_name(channel)?;
-        let query_bytes = Self::build_dns_query(&query_name, RecordType::TXT)?;
+    async fn recv_frames(&self, channel: &str, cursor: Option<u64>) -> Result<(Vec<Vec<u8>>, Option<u64>), TransportError> {
+        let query_name = self.build_recv_query_name(channel, cursor)?;
+        let query_bytes = Self::build_dns_query(&query_name, RecordType::TXT, self.use_edns)?;
         let response_bytes = self.send_dns_query(&query_bytes).await?;
 
         let envelopes = Self::parse_txt_responses(&response_bytes)?;
         if envelopes.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], None));
         }
 
         let mut frames = Vec::with_capacity(envelopes.len());
+        let mut max_seq: Option<u64> = None;
         for envelope_str in envelopes {
             match dns_message_broker::encoding::decode_envelope(&envelope_str) {
-                Ok(parts) => frames.push(parts.payload),
+                Ok(parts) => {
+                    max_seq = Some(max_seq.map_or(parts.sequence, |m: u64| m.max(parts.sequence)));
+                    frames.push(parts.payload);
+                }
                 Err(e) => {
                     debug!("failed to decode envelope in batch: {e}");
                 }
             }
         }
-        Ok(frames)
+        Ok((frames, max_seq))
     }
 
     async fn query_status(&self, channel: &str) -> Result<usize, TransportError> {
         let query_name = self.build_status_query_name(channel)?;
-        let query_bytes = Self::build_dns_query(&query_name, RecordType::A)?;
+        let query_bytes = Self::build_dns_query(&query_name, RecordType::A, self.use_edns)?;
         let response_bytes = self.send_dns_query(&query_bytes).await?;
         let ip = Self::parse_a_response(&response_bytes)?;
         decode_status_ip(ip)
@@ -448,9 +499,11 @@ pub async fn recv_frames_parallel(
     channel: &str,
     count: usize,
     query_timeout: Duration,
-) -> Vec<Vec<u8>> {
+    use_edns: bool,
+    cursor: Option<u64>,
+) -> (Vec<Vec<u8>>, Option<u64>) {
     if count == 0 {
-        return vec![];
+        return (vec![], None);
     }
 
     let mut join_set = tokio::task::JoinSet::new();
@@ -462,14 +515,20 @@ pub async fn recv_frames_parallel(
         let timeout = query_timeout;
 
         join_set.spawn(async move {
-            recv_single_parallel_query(resolver, &domain, &chan, timeout).await
+            recv_single_parallel_query(resolver, &domain, &chan, timeout, use_edns, cursor).await
         });
     }
 
     let mut all_frames = Vec::new();
+    let mut max_seq: Option<u64> = None;
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok(frames)) => all_frames.extend(frames),
+            Ok(Ok((frames, seq))) => {
+                all_frames.extend(frames);
+                if let Some(s) = seq {
+                    max_seq = Some(max_seq.map_or(s, |m: u64| m.max(s)));
+                }
+            }
             Ok(Err(e)) => {
                 debug!("parallel recv query failed: {e}");
             }
@@ -479,7 +538,7 @@ pub async fn recv_frames_parallel(
         }
     }
 
-    all_frames
+    (all_frames, max_seq)
 }
 
 /// Execute a single parallel TXT recv query on its own ephemeral UDP socket.
@@ -488,7 +547,9 @@ async fn recv_single_parallel_query(
     controlled_domain: &str,
     channel: &str,
     query_timeout: Duration,
-) -> Result<Vec<Vec<u8>>, TransportError> {
+    use_edns: bool,
+    cursor: Option<u64>,
+) -> Result<(Vec<Vec<u8>>, Option<u64>), TransportError> {
     // 1. Bind an ephemeral UDP socket
     let bind_addr: SocketAddr = if resolver_addr.is_ipv6() {
         "[::]:0".parse().unwrap()
@@ -499,8 +560,8 @@ async fn recv_single_parallel_query(
         .await
         .map_err(|e| TransportError::SocketBind(format!("parallel socket bind: {e}")))?;
 
-    // 2. Generate a unique nonce
-    let nonce = DnsTransport::generate_nonce();
+    // 2. Generate a unique nonce (with optional cursor suffix)
+    let nonce = DnsTransport::generate_nonce_with_cursor(cursor);
 
     // 3. Build the TXT query name: <nonce>.<channel>.<domain>
     let full_name = format!("{}.{}.{}.", nonce, channel, controlled_domain);
@@ -508,7 +569,7 @@ async fn recv_single_parallel_query(
         .map_err(|e| TransportError::DnsProtocol(format!("invalid DNS name: {e}")))?;
 
     // 4. Build and send the DNS query
-    let query_bytes = DnsTransport::build_dns_query(&query_name, RecordType::TXT)?;
+    let query_bytes = DnsTransport::build_dns_query(&query_name, RecordType::TXT, use_edns)?;
     socket.send_to(&query_bytes, resolver_addr).await?;
 
     // 5. Wait for response with timeout
@@ -527,20 +588,24 @@ async fn recv_single_parallel_query(
     // 6. Parse TXT records and decode envelopes
     let envelopes = DnsTransport::parse_txt_responses(&response_bytes)?;
     if envelopes.is_empty() {
-        return Ok(vec![]);
+        return Ok((vec![], None));
     }
 
-    // 7. Return the frame payloads
+    // 7. Return the frame payloads and max store sequence
     let mut frames = Vec::with_capacity(envelopes.len());
+    let mut max_seq: Option<u64> = None;
     for envelope_str in envelopes {
         match dns_message_broker::encoding::decode_envelope(&envelope_str) {
-            Ok(parts) => frames.push(parts.payload),
+            Ok(parts) => {
+                max_seq = Some(max_seq.map_or(parts.sequence, |m: u64| m.max(parts.sequence)));
+                frames.push(parts.payload);
+            }
             Err(e) => {
                 debug!("parallel recv: failed to decode envelope: {e}");
             }
         }
     }
-    Ok(frames)
+    Ok((frames, max_seq))
 }
 
 // ---------------------------------------------------------------------------
@@ -632,15 +697,11 @@ impl TransportBackend for DirectTransport {
         Ok(())
     }
 
-    async fn recv_frames(&self, channel: &str) -> Result<Vec<Vec<u8>>, TransportError> {
+    async fn recv_frames(&self, channel: &str, cursor: Option<u64>) -> Result<(Vec<Vec<u8>>, Option<u64>), TransportError> {
         let mut store = self.store.write().await;
-        // Use peek_many (non-destructive with replay) even in embedded mode.
-        // Although there's no network loss between the store and the exit node,
-        // the client polls through a recursive resolver where UDP responses
-        // can be lost. The broker needs the replay buffer to re-deliver data
-        // that the client never received.
-        let msgs = store.peek_many(channel, 10);
-        Ok(msgs.into_iter().map(|msg| msg.payload).collect())
+        let msgs = store.peek_many(channel, 10, cursor);
+        let max_seq = msgs.last().map(|m| m.sequence);
+        Ok((msgs.into_iter().map(|msg| msg.payload).collect(), max_seq))
     }
 
     async fn query_status(&self, channel: &str) -> Result<usize, TransportError> {

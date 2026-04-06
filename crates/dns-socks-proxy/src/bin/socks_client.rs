@@ -51,7 +51,7 @@ impl ControlDispatcher {
     /// Creates a `tokio::sync::mpsc` channel with buffer size 4, stores the
     /// `Sender` side keyed by `session_id`, and hands back the `Receiver`.
     pub fn register(&self, session_id: SessionId) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
         self.senders.lock().unwrap().insert(session_id, tx);
         rx
     }
@@ -147,8 +147,8 @@ fn spawn_control_poller(
         let mut backoff = AdaptiveBackoff::new(poll_active, backoff_max);
 
         loop {
-            match transport.recv_frames(&recv_control_channel).await {
-                Ok(frames) if !frames.is_empty() => {
+            match transport.recv_frames(&recv_control_channel, None).await {
+                Ok((frames, _seq)) if !frames.is_empty() => {
                     for data in frames {
                         // Need at least 16 bytes for the trailing MAC.
                         if data.len() < 16 {
@@ -289,7 +289,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let poller_transport = Arc::new(
         DnsTransport::new(shared_config.resolver_addr, shared_config.controlled_domain.clone())
             .await?
-            .with_query_interval(shared_config.query_interval),
+            .with_query_interval(shared_config.query_interval)
+            .with_edns(!shared_config.no_edns),
     );
 
     // Compute the receive control channel name.
@@ -340,7 +341,8 @@ async fn handle_connection(
     let transport = Arc::new(
         DnsTransport::new(config.resolver_addr, config.controlled_domain.clone())
             .await?
-            .with_query_interval(config.query_interval),
+            .with_query_interval(config.query_interval)
+            .with_edns(!config.no_edns),
     );
 
     // 1. SOCKS5 handshake.
@@ -702,6 +704,10 @@ async fn downstream_task(
     };
     let mut backoff = AdaptiveBackoff::new(config.poll_active, config.backoff_max);
     let _query_timeout = Duration::from_secs(2);
+    // Track the highest store sequence seen from broker responses.
+    // Used as cursor for replay advancement: tells the broker to prune
+    // replay entries with sequence <= this value.
+    let mut max_store_seq: Option<u64> = None;
 
     loop {
         // Check session is still alive.
@@ -719,9 +725,19 @@ async fn downstream_task(
             }
         }
 
+        // Use the highest store sequence we've seen + 1 as the cursor.
+        // This tells the broker to prune replay entries we've already received.
+        let cursor = max_store_seq.map(|s| s + 1);
+
         // Poll for downstream frames using the main transport (with EDNS0).
-        let frames_result = match transport.recv_frames(&downstream_channel).await {
-            Ok(frames) => Ok(frames),
+        let frames_result = match transport.recv_frames(&downstream_channel, cursor).await {
+            Ok((frames, seq)) => {
+                // Update max_store_seq from the broker's response.
+                if let Some(s) = seq {
+                    max_store_seq = Some(max_store_seq.map_or(s, |m| m.max(s)));
+                }
+                Ok(frames)
+            }
             Err(e) => Err(e),
         };
 

@@ -132,6 +132,11 @@ pub struct SocksClientCli {
     /// Helps avoid rate limiting by recursive resolvers.
     #[arg(long, default_value_t = 0)]
     pub query_interval_ms: u64,
+
+    /// Disable EDNS0 OPT record on TXT queries (reduces response size for
+    /// compatibility with recursive resolvers that truncate large UDP responses).
+    #[arg(long)]
+    pub no_edns: bool,
 }
 
 /// Validated configuration for the socks-client binary.
@@ -172,6 +177,8 @@ pub struct SocksClientConfig {
     pub queue_timeout: Duration,
     /// Minimum interval between DNS queries (rate limiting).
     pub query_interval: Duration,
+    /// Whether to disable EDNS0 on TXT queries.
+    pub no_edns: bool,
 }
 
 impl SocksClientCli {
@@ -209,6 +216,7 @@ impl SocksClientCli {
             max_concurrent_sessions: self.max_concurrent_sessions,
             queue_timeout: Duration::from_millis(self.queue_timeout_ms),
             query_interval: Duration::from_millis(self.query_interval_ms),
+            no_edns: self.no_edns,
         })
     }
 }
@@ -280,6 +288,11 @@ pub struct ExitNodeCli {
     /// Maximum backoff interval in milliseconds (default: value of poll_idle_ms).
     #[arg(long)]
     pub backoff_max_ms: Option<u64>,
+
+    /// Disable EDNS0 OPT record on TXT queries (reduces response size for
+    /// compatibility with recursive resolvers that truncate large UDP responses).
+    #[arg(long)]
+    pub no_edns: bool,
 }
 
 /// Validated configuration for the exit-node binary.
@@ -312,6 +325,8 @@ pub struct ExitNodeConfig {
     pub max_parallel_queries: usize,
     /// Maximum backoff interval (defaults to poll_idle).
     pub backoff_max: Duration,
+    /// Whether to disable EDNS0 on TXT queries.
+    pub no_edns: bool,
 }
 
 impl ExitNodeCli {
@@ -354,6 +369,7 @@ impl ExitNodeCli {
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
             max_parallel_queries: self.max_parallel_queries.max(1),
             backoff_max,
+            no_edns: self.no_edns,
         })
     }
 }
@@ -482,6 +498,7 @@ mod tests {
             max_concurrent_sessions: 8,
             queue_timeout_ms: 30000,
             query_interval_ms: 0,
+            no_edns: false,
         }
     }
 
@@ -525,6 +542,7 @@ mod tests {
             connect_timeout_ms: 10000,
             max_parallel_queries: 8,
             backoff_max_ms: None,
+            no_edns: false,
         }
     }
 

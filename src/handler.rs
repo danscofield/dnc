@@ -359,6 +359,15 @@ fn handle_receive<C: Clock>(
     let nonce_label = &remaining[0];
     let use_pop = nonce_label.starts_with('P');
 
+    // Parse cursor from nonce: look for -c<number> suffix (only for peek mode)
+    let cursor: Option<u64> = if !use_pop {
+        nonce_label.rfind("-c").and_then(|pos| {
+            nonce_label[pos + 2..].parse::<u64>().ok()
+        })
+    } else {
+        None
+    };
+
     // Determine how many messages to pop based on EDNS0 buffer size.
     // Each TXT record envelope is roughly 200-300 bytes in the wire response.
     // With EDNS0, we can fit multiple records. Without EDNS0, stick to 1.
@@ -372,7 +381,7 @@ fn handle_receive<C: Clock>(
     let messages = if use_pop {
         store.pop_many(channel, max_messages)
     } else {
-        store.peek_many(channel, max_messages)
+        store.peek_many(channel, max_messages, cursor)
     };
     if messages.is_empty() {
         // No messages — NOERROR with zero answers

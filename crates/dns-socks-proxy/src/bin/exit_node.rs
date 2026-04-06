@@ -55,7 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let resolver = config
                 .resolver_addr
                 .expect("resolver required in standalone mode");
-            Arc::new(DnsTransport::new(resolver, config.controlled_domain.clone()).await?)
+            Arc::new(
+                DnsTransport::new(resolver, config.controlled_domain.clone())
+                    .await?
+                    .with_edns(!config.no_edns),
+            )
         }
         DeploymentMode::Embedded => {
             // 1. Read and parse the Broker TOML config file.
@@ -151,8 +155,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::time::sleep(backoff.current()) => {}
         }
 
-        match transport.recv_frames(&control_channel).await {
-            Ok(frames) if !frames.is_empty() => {
+        match transport.recv_frames(&control_channel, None).await {
+            Ok((frames, _seq)) if !frames.is_empty() => {
                 backoff.reset();
 
                 for data in frames {
@@ -538,6 +542,8 @@ async fn upstream_task(
     };
     let mut backoff = AdaptiveBackoff::new(config.poll_active, config.backoff_max);
     let query_timeout = Duration::from_secs(2);
+    // Track the highest store sequence seen from broker responses.
+    let mut max_store_seq: Option<u64> = None;
 
     loop {
         // Check session is still alive.
@@ -555,6 +561,9 @@ async fn upstream_task(
             }
         }
 
+        // Use the highest store sequence we've seen + 1 as the cursor.
+        let cursor = max_store_seq.map(|s| s + 1);
+
         // Phase 1: Query status to determine queue depth.
         let frames_result = match transport.query_status(&upstream_channel).await {
             Ok(0) => {
@@ -567,34 +576,45 @@ async fn upstream_task(
                 // Data available — reset backoff and fire parallel queries.
                 backoff.reset();
                 let count = depth.min(config.max_parallel_queries);
-                // Parallel recv only makes sense for DnsTransport (standalone mode).
-                // For DirectTransport (embedded), resolver_addr is None; fall back to recv_frames.
                 match config.resolver_addr {
                     Some(resolver_addr) => {
-                        let parallel_frames = recv_frames_parallel(
+                        let (parallel_frames, seq) = recv_frames_parallel(
                             resolver_addr,
                             &config.controlled_domain,
                             &upstream_channel,
                             count,
                             query_timeout,
+                            !config.no_edns,
+                            cursor,
                         )
                         .await;
+                        if let Some(s) = seq {
+                            max_store_seq = Some(max_store_seq.map_or(s, |m| m.max(s)));
+                        }
                         Ok(parallel_frames)
                     }
                     None => {
-                        // Embedded mode — DirectTransport already drains multiple messages.
-                        match transport.recv_frames(&upstream_channel).await {
-                            Ok(frames) => Ok(frames),
+                        match transport.recv_frames(&upstream_channel, cursor).await {
+                            Ok((frames, seq)) => {
+                                if let Some(s) = seq {
+                                    max_store_seq = Some(max_store_seq.map_or(s, |m| m.max(s)));
+                                }
+                                Ok(frames)
+                            }
                             Err(e) => Err(e),
                         }
                     }
                 }
             }
             Err(e) => {
-                // Status query failed — fall back to single recv_frames call.
                 debug!(error = %e, "status query failed, falling back to single recv_frames");
-                match transport.recv_frames(&upstream_channel).await {
-                    Ok(frames) => Ok(frames),
+                match transport.recv_frames(&upstream_channel, cursor).await {
+                    Ok((frames, seq)) => {
+                        if let Some(s) = seq {
+                            max_store_seq = Some(max_store_seq.map_or(s, |m| m.max(s)));
+                        }
+                        Ok(frames)
+                    }
                     Err(e2) => Err(e2),
                 }
             }

@@ -183,6 +183,7 @@ proptest! {
             max_concurrent_sessions: max_sessions,
             queue_timeout_ms: timeout_ms,
             query_interval_ms: 0,
+            no_edns: false,
         };
         let cfg = cli.into_config().unwrap();
         prop_assert_eq!(cfg.max_concurrent_sessions, max_sessions);
