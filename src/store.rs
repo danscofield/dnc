@@ -236,7 +236,7 @@ impl<C: Clock> ChannelStore<C> {
     pub fn queue_depth(&self, channel: &str) -> usize {
         self.channels
             .get(channel)
-            .map_or(0, |ch| ch.messages.len())
+            .map_or(0, |ch| ch.messages.len() + ch.replay.len())
     }
 
     /// Remove expired messages and inactive channels.
@@ -687,15 +687,15 @@ mod tests {
             );
 
             // After first peek_many, messages have moved from `messages` to `replay`.
-            // queue_depth counts only unserved messages in `messages` (not replay),
-            // so it correctly returns 0. The key fix is that peek_many preserves
-            // messages in the replay buffer for re-delivery.
+            // queue_depth includes both unserved messages and replay entries,
+            // so it should still equal n (the messages are now in replay).
             let depth_after_first_poll = store.queue_depth("test-ch");
             prop_assert_eq!(
                 depth_after_first_poll,
-                0,
-                "queue_depth should be 0 after peek_many (messages moved to replay buffer), \
+                n,
+                "queue_depth should be {} after peek_many (messages in replay buffer), \
                  but got {}",
+                n,
                 depth_after_first_poll
             );
 

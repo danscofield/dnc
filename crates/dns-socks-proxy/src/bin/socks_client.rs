@@ -20,7 +20,7 @@ use dns_socks_proxy::frame::{
 use dns_socks_proxy::session::{SessionManager, SessionState};
 use dns_socks_proxy::socks::{socks5_handshake, socks5_reply};
 use dns_socks_proxy::transport::{
-    compute_payload_budget, recv_frames_parallel, AdaptiveBackoff, DnsTransport, TransportBackend,
+    compute_payload_budget, AdaptiveBackoff, DnsTransport, TransportBackend,
 };
 
 /// Nonce length used in DNS queries.
@@ -697,7 +697,7 @@ async fn downstream_task(
         control_key: [0u8; 32],
     };
     let mut backoff = AdaptiveBackoff::new(config.poll_active, config.backoff_max);
-    let query_timeout = Duration::from_secs(2);
+    let _query_timeout = Duration::from_secs(2);
 
     loop {
         // Check session is still alive.
@@ -715,36 +715,10 @@ async fn downstream_task(
             }
         }
 
-        // Phase 1: Query status to determine queue depth.
-        let frames_result = match transport.query_status(&downstream_channel).await {
-            Ok(0) => {
-                // No data available — increase backoff and sleep.
-                backoff.increase();
-                tokio::time::sleep(backoff.current()).await;
-                continue;
-            }
-            Ok(depth) => {
-                // Data available — reset backoff and fire parallel queries.
-                backoff.reset();
-                let count = depth.min(config.max_parallel_queries);
-                let parallel_frames = recv_frames_parallel(
-                    config.resolver_addr,
-                    &config.controlled_domain,
-                    &downstream_channel,
-                    count,
-                    query_timeout,
-                )
-                .await;
-                Ok(parallel_frames)
-            }
-            Err(e) => {
-                // Status query failed — fall back to single recv_frames call.
-                debug!(error = %e, "status query failed, falling back to single recv_frames");
-                match transport.recv_frames(&downstream_channel).await {
-                    Ok(frames) => Ok(frames),
-                    Err(e2) => Err(e2),
-                }
-            }
+        // Poll for downstream frames using the main transport (with EDNS0).
+        let frames_result = match transport.recv_frames(&downstream_channel).await {
+            Ok(frames) => Ok(frames),
+            Err(e) => Err(e),
         };
 
         // Phase 2: Process received frames through the decryption/reassembly/ACK pipeline.
