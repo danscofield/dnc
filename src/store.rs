@@ -185,22 +185,7 @@ impl<C: Clock> ChannelStore<C> {
 
         let mut result = Vec::new();
 
-        // If replay is non-empty and queue is empty, this is a re-poll
-        // (possibly for a lost UDP response). Return replay contents one
-        // final time AND clear the replay buffer, so the next peek returns
-        // empty immediately.
-        if !ch.replay.is_empty() && ch.messages.is_empty() {
-            let replay_result: Vec<StoredMessage> = ch.replay.iter().take(max).cloned().collect();
-            ch.replay.clear();
-            ch.replay_cursor = 0;
-            if !replay_result.is_empty() {
-                ch.last_activity = now;
-            }
-            return replay_result;
-        }
-
-        // Serve replay first (re-delivery for lost UDP responses), then
-        // fill remaining capacity from the messages queue.
+        // If replay is non-empty, return replay contents first
         if !ch.replay.is_empty() {
             for msg in ch.replay.iter() {
                 if result.len() >= max {
@@ -221,6 +206,9 @@ impl<C: Clock> ChannelStore<C> {
             }
         } else if !ch.replay.is_empty() {
             // No new messages were drained — this is a confirming re-poll.
+            // The client successfully received the previous batch, so clear
+            // the replay buffer. This prevents infinite re-delivery while
+            // still allowing one re-poll for lost UDP responses.
             ch.replay.clear();
             ch.replay_cursor = 0;
         }
