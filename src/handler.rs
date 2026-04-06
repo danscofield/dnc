@@ -357,7 +357,7 @@ fn handle_receive<C: Clock>(
     // This allows simple consumers (like dnc) to get consume-once semantics.
     let channel = &after_nonce[0];
     let nonce_label = &remaining[0];
-    let use_pop = nonce_label.starts_with('p') || nonce_label.starts_with('P');
+    let use_pop = nonce_label.starts_with('P');
 
     // Determine how many messages to pop based on EDNS0 buffer size.
     // Each TXT record envelope is roughly 200-300 bytes in the wire response.

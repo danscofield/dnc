@@ -40,13 +40,13 @@ To receive messages, the client sends a DNS TXT query:
 <nonce>.<channel>.<controlled_domain>
 ```
 
-The default behavior is non-destructive (peek with replay buffer). To consume messages destructively (pop), prefix the nonce with `p`:
+The default behavior is non-destructive (peek with replay buffer). To consume messages destructively (pop), prefix the nonce with uppercase `P`:
 
 ```
-p<nonce>.<channel>.<controlled_domain>
+P<nonce>.<channel>.<controlled_domain>
 ```
 
-The SOCKS tunnel uses peek semantics for reliability over lossy UDP. The `dnc` tool uses pop semantics so messages are consumed on read.
+The SOCKS tunnel uses peek semantics for reliability over lossy UDP (its nonces are lowercase alphanumeric, never starting with `P`). The `dnc` tool uses pop semantics so messages are consumed on read.
 
 The broker returns pending messages as TXT records. Each TXT record contains an envelope string:
 
@@ -255,4 +255,4 @@ Offset  Size  Field
 - Large inputs are chunked into multiple frames with incrementing sequence numbers; the last frame has `flags=EOF`
 - The receiver reassembles frames in sequence order and outputs data as contiguous frames arrive
 - Maximum stream size: 65535 frames × ~124 bytes/frame ≈ 8MB
-- `dnc` uses pop semantics (nonce prefix `p`) so each frame is consumed on read
+- `dnc` uses pop semantics (nonce prefix `P`) so each frame is consumed on read

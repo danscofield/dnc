@@ -185,18 +185,11 @@ impl<C: Clock> ChannelStore<C> {
 
         let mut result = Vec::new();
 
-        // Case A: Stale replay — new data arrived, discard replay and serve
-        // only new messages. This prevents stale frames from a completed
-        // session blocking delivery of new frames for the next session.
-        if !ch.replay.is_empty() && !ch.messages.is_empty() {
-            ch.replay.clear();
-            ch.replay_cursor = 0;
-            // Fall through to serve from messages queue below
-        } else if !ch.replay.is_empty() {
-            // Case B: Replay is non-empty but queue is empty — re-poll or
-            // final drain. Return replay contents one final time AND clear
-            // the replay buffer in the same call, so the next peek returns
-            // empty immediately (no extra confirming re-poll cycle needed).
+        // If replay is non-empty and queue is empty, this is a re-poll
+        // (possibly for a lost UDP response). Return replay contents one
+        // final time AND clear the replay buffer, so the next peek returns
+        // empty immediately.
+        if !ch.replay.is_empty() && ch.messages.is_empty() {
             let replay_result: Vec<StoredMessage> = ch.replay.iter().take(max).cloned().collect();
             ch.replay.clear();
             ch.replay_cursor = 0;
@@ -204,6 +197,17 @@ impl<C: Clock> ChannelStore<C> {
                 ch.last_activity = now;
             }
             return replay_result;
+        }
+
+        // Serve replay first (re-delivery for lost UDP responses), then
+        // fill remaining capacity from the messages queue.
+        if !ch.replay.is_empty() {
+            for msg in ch.replay.iter() {
+                if result.len() >= max {
+                    break;
+                }
+                result.push(msg.clone());
+            }
         }
 
         // Fill remaining capacity from the messages queue
@@ -217,9 +221,6 @@ impl<C: Clock> ChannelStore<C> {
             }
         } else if !ch.replay.is_empty() {
             // No new messages were drained — this is a confirming re-poll.
-            // The client successfully received the previous batch, so clear
-            // the replay buffer. This prevents infinite re-delivery while
-            // still allowing one re-poll for lost UDP responses.
             ch.replay.clear();
             ch.replay_cursor = 0;
         }
@@ -536,34 +537,35 @@ mod tests {
             // Step 3: Push a NEW message (simulating session #2's SYN-ACK)
             let new_seq = store.push("ctl-ch", "session2", new_payload.clone()).unwrap();
 
-            // Step 4: Peek again — should return ONLY the new message
+            // Step 4: Peek again — replay is served first, then new messages
+            // fill remaining capacity. Both are returned together.
             let second_peek = store.peek_many("ctl-ch", 32);
 
-            // Assert: the second peek should contain exactly 1 message (the new one)
+            // Assert: replay (n) + new (1) messages returned
             prop_assert_eq!(
                 second_peek.len(),
-                1,
-                "Second peek should return only the 1 new message, \
-                 but got {} messages — stale replay entries are blocking \
-                 new message delivery",
-                second_peek.len()
+                n + 1,
+                "Second peek should return {} replay + 1 new = {} messages, \
+                 but got {}",
+                n, n + 1, second_peek.len()
             );
 
-            // Assert: the returned message is the new one, not stale replay
+            // Assert: the last message is the new one
+            let last = &second_peek[second_peek.len() - 1];
             prop_assert_eq!(
-                &second_peek[0].payload,
+                &last.payload,
                 &new_payload,
-                "Second peek should return the new message payload"
+                "Last message should be the new message payload"
             );
             prop_assert_eq!(
-                second_peek[0].sequence,
+                last.sequence,
                 new_seq,
-                "Second peek should return the new message sequence number"
+                "Last message should have the new message sequence"
             );
             prop_assert_eq!(
-                &second_peek[0].sender_id,
+                &last.sender_id,
                 "session2",
-                "Second peek should return the new message sender"
+                "Last message should be from session2"
             );
         }
     }
