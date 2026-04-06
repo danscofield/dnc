@@ -16,7 +16,9 @@ Application → SOCKS5 → socks-client → DNS A queries → Broker → exit-no
                                     ← DNS TXT responses ←
 ```
 
-Data is split into ~105-byte frames, encrypted with ChaCha20-Poly1305 (per-session keys via X25519 + PSK), and encoded as DNS queries. The broker is a simple store-and-forward relay — all tunnel logic (sessions, reliability, encryption) lives in the two endpoints.
+Data is split into ~104-byte frames, encrypted with ChaCha20-Poly1305 (per-session keys via X25519 + PSK), and encoded as DNS queries. The broker is a simple store-and-forward relay — all tunnel logic (sessions, reliability, encryption) lives in the two endpoints.
+
+See [PROTOCOL.md](PROTOCOL.md) for the full wire protocol specification.
 
 ## Quick start
 
@@ -101,6 +103,7 @@ Requires [zig](https://ziglang.org/) and [cargo-zigbuild](https://github.com/rus
 crates/
   dns-socks-proxy/        # SOCKS tunnel (socks-client + exit-node binaries)
     src/
+      lib.rs              # Crate root, re-exports
       frame.rs            # Binary frame protocol (15-byte header, encode/decode)
       crypto.rs           # X25519 key exchange, ChaCha20-Poly1305, HMAC-SHA256
       reliability.rs      # Retransmit buffer, reassembly buffer, sliding window
@@ -112,12 +115,15 @@ crates/
         socks_client.rs   # SOCKS5 proxy client binary
         exit_node.rs      # Exit node binary (standalone or embedded)
 src/                      # DNS Message Broker
+  lib.rs                  # Crate root, re-exports
+  main.rs                 # Broker binary entry point
   server.rs               # UDP DNS server loop
   handler.rs              # Query routing (send via A, receive via TXT)
-  store.rs                # Per-channel FIFO message store
+  store.rs                # Per-channel FIFO message store with replay buffer
   encoding.rs             # Base32 encoding, envelope format
   dns.rs                  # DNS packet building/parsing
   config.rs               # Broker TOML configuration
+  error.rs                # Error types
 examples/
   dnc.rs                  # DNS netcat — CLI tool for sending/receiving messages
 ```
@@ -128,14 +134,15 @@ Direct to broker: ~3 seconds for a simple HTTP request (SYN + request + response
 
 Through recursive resolver: slower due to extra DNS hops, but functional.
 
-Each DNS message carries ~105 bytes of payload. The tunnel uses EDNS0 to batch multiple frames per TXT response (up to ~1232 bytes), reducing polling overhead.
+Each DNS message carries ~104 bytes of payload. The tunnel uses EDNS0 to batch multiple frames per TXT response (up to ~1232 bytes), reducing polling overhead.
 
 ## Security
 
 - Per-session encryption: X25519 ephemeral key exchange authenticated by a pre-shared key
 - DATA frames encrypted with ChaCha20-Poly1305
-- Control frames (SYN/SYN-ACK/FIN/RST/ACK) authenticated with HMAC-SHA256
+- Control frames (SYN/SYN-ACK/FIN/RST) authenticated with HMAC-SHA256 (truncated to 16 bytes)
 - PSK must be at least 32 bytes
+- Concurrent session limiter prevents resource exhaustion
 
 ## CLI reference
 
@@ -152,9 +159,15 @@ Each DNS message carries ~105 bytes of payload. The tunnel uses EDNS0 to batch m
 | `--listen-addr` | `127.0.0.1` | Listen address |
 | `--listen-port` | `1080` | Listen port |
 | `--rto-ms` | `2000` | Retransmission timeout (ms) |
+| `--max-retransmits` | `10` | Max retransmissions before RST |
 | `--window-size` | `8` | Sliding window size |
 | `--poll-active-ms` | `50` | Active poll interval (ms) |
 | `--poll-idle-ms` | `500` | Idle poll interval (ms) |
+| `--backoff-max-ms` | value of `--poll-idle-ms` | Maximum backoff interval (ms) |
+| `--connect-timeout-ms` | `30000` | SYN-ACK timeout (ms) |
+| `--max-parallel-queries` | `8` | Parallel TXT queries per poll cycle |
+| `--max-concurrent-sessions` | `8` | Max concurrent active sessions |
+| `--queue-timeout-ms` | `30000` | Wait timeout for queued connections (0 = reject immediately) |
 
 ### exit-node
 
@@ -168,7 +181,13 @@ Each DNS message carries ~105 bytes of payload. The tunnel uses EDNS0 to batch m
 | `--psk-file` | — | Path to PSK file |
 | `--psk` | — | PSK as hex string |
 | `--rto-ms` | `2000` | Retransmission timeout (ms) |
+| `--max-retransmits` | `10` | Max retransmissions before RST |
+| `--window-size` | `8` | Sliding window size |
+| `--poll-active-ms` | `50` | Active poll interval (ms) |
+| `--poll-idle-ms` | `500` | Idle poll interval (ms) |
+| `--backoff-max-ms` | value of `--poll-idle-ms` | Maximum backoff interval (ms) |
 | `--connect-timeout-ms` | `10000` | TCP connect timeout (ms) |
+| `--max-parallel-queries` | `8` | Parallel TXT queries per poll cycle |
 
 ### dnc (DNS netcat)
 

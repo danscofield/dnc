@@ -26,7 +26,6 @@ Listen mode — prints messages to stdout:
 ```bash
 dnc -l general              # poll continuously
 dnc -l -1 general           # receive one message and exit
-dnc -l -i 200 general       # poll every 200ms
 ```
 
 Options:
@@ -34,9 +33,8 @@ Options:
 -l          Listen mode (receive)
 -1          Receive one message and exit
 -s NAME     Sender ID (default: "anon")
--b ADDR     Broker address (default: 127.0.0.1:15353)
+-b ADDR     Broker address (default: system resolver, or 1.1.1.1:53)
 -d DOMAIN   Controlled domain (default: broker.example.com)
--i MS       Poll interval in ms (default: 500)
 ```
 
 ## Manual usage
