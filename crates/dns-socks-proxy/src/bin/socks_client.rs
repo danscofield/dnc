@@ -287,7 +287,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a dedicated DnsTransport for the control channel poller.
     let poller_transport = Arc::new(
-        DnsTransport::new(shared_config.resolver_addr, shared_config.controlled_domain.clone()).await?,
+        DnsTransport::new(shared_config.resolver_addr, shared_config.controlled_domain.clone())
+            .await?
+            .with_query_interval(shared_config.query_interval),
     );
 
     // Compute the receive control channel name.
@@ -336,7 +338,9 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create a per-session DNS transport (own UDP socket to avoid response cross-contamination).
     let transport = Arc::new(
-        DnsTransport::new(config.resolver_addr, config.controlled_domain.clone()).await?,
+        DnsTransport::new(config.resolver_addr, config.controlled_domain.clone())
+            .await?
+            .with_query_interval(config.query_interval),
     );
 
     // 1. SOCKS5 handshake.

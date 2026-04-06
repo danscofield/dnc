@@ -127,6 +127,11 @@ pub struct SocksClientCli {
     /// Set to 0 to reject immediately when all permits are in use.
     #[arg(long, default_value_t = 30000)]
     pub queue_timeout_ms: u64,
+
+    /// Minimum interval between DNS queries in milliseconds (default: 0 = no throttle).
+    /// Helps avoid rate limiting by recursive resolvers.
+    #[arg(long, default_value_t = 0)]
+    pub query_interval_ms: u64,
 }
 
 /// Validated configuration for the socks-client binary.
@@ -165,6 +170,8 @@ pub struct SocksClientConfig {
     pub max_concurrent_sessions: usize,
     /// Queue timeout for waiting connections.
     pub queue_timeout: Duration,
+    /// Minimum interval between DNS queries (rate limiting).
+    pub query_interval: Duration,
 }
 
 impl SocksClientCli {
@@ -201,6 +208,7 @@ impl SocksClientCli {
             backoff_max,
             max_concurrent_sessions: self.max_concurrent_sessions,
             queue_timeout: Duration::from_millis(self.queue_timeout_ms),
+            query_interval: Duration::from_millis(self.query_interval_ms),
         })
     }
 }
@@ -473,6 +481,7 @@ mod tests {
             backoff_max_ms: None,
             max_concurrent_sessions: 8,
             queue_timeout_ms: 30000,
+            query_interval_ms: 0,
         }
     }
 

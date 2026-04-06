@@ -138,6 +138,8 @@ pub struct DnsTransport {
     query_timeout: Duration,
     max_retries: usize,
     channel_full_backoff: Duration,
+    query_interval: Duration,
+    last_query: tokio::sync::Mutex<tokio::time::Instant>,
 }
 
 impl DnsTransport {
@@ -161,6 +163,8 @@ impl DnsTransport {
             query_timeout: DEFAULT_QUERY_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
             channel_full_backoff: DEFAULT_CHANNEL_FULL_BACKOFF,
+            query_interval: Duration::ZERO,
+            last_query: tokio::sync::Mutex::new(tokio::time::Instant::now()),
         })
     }
 
@@ -174,6 +178,25 @@ impl DnsTransport {
     pub fn with_channel_full_backoff(mut self, backoff: Duration) -> Self {
         self.channel_full_backoff = backoff;
         self
+    }
+
+    /// Set the minimum interval between DNS queries (rate limiting).
+    pub fn with_query_interval(mut self, interval: Duration) -> Self {
+        self.query_interval = interval;
+        self
+    }
+
+    /// Throttle: wait until at least `query_interval` has passed since the last query.
+    async fn throttle(&self) {
+        if self.query_interval.is_zero() {
+            return;
+        }
+        let mut last = self.last_query.lock().await;
+        let elapsed = last.elapsed();
+        if elapsed < self.query_interval {
+            tokio::time::sleep(self.query_interval - elapsed).await;
+        }
+        *last = tokio::time::Instant::now();
     }
 
     /// Generate a random 4-char lowercase alphanumeric nonce.
@@ -229,6 +252,7 @@ impl DnsTransport {
     /// Send a DNS query and wait for a response, with timeout and retries.
     async fn send_dns_query(&self, query_bytes: &[u8]) -> Result<Vec<u8>, TransportError> {
         for attempt in 0..self.max_retries {
+            self.throttle().await;
             self.socket.send_to(query_bytes, self.resolver_addr).await?;
 
             let mut buf = vec![0u8; UDP_BUF_SIZE];
