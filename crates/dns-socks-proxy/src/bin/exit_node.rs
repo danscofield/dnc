@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use dns_socks_proxy::config::{DeploymentMode, ExitNodeCli, ExitNodeConfig};
+use dns_socks_proxy::guard::is_blocked;
 use dns_socks_proxy::crypto::{
     compute_control_mac, decrypt_data, derive_session_key, encrypt_data, generate_keypair,
     verify_control_mac, Direction, Psk, SessionKey,
@@ -336,6 +337,21 @@ async fn handle_syn(
 
     // 4. Attempt TCP connection to target within connect_timeout.
     let target_socket_addr = resolve_target(&target_addr, target_port).await?;
+
+    // --- Private network guard ---
+    if is_blocked(target_socket_addr.ip(), &config.blocked_networks) {
+        warn!(session_id = %session_id, addr = %target_socket_addr, "blocked by private network guard");
+        send_rst(
+            &transport,
+            &client_control_channel,
+            &config.node_id,
+            &session_id,
+            &config.psk,
+        )
+        .await;
+        return Ok(());
+    }
+
     let tcp_stream = match tokio::time::timeout(
         config.connect_timeout,
         TcpStream::connect(target_socket_addr),

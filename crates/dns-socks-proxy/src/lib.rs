@@ -5,3 +5,4 @@ pub mod transport;
 pub mod session;
 pub mod socks;
 pub mod config;
+pub mod guard;

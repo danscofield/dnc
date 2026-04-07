@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 480f3dccc3e806777b88cc0efda875521c55a341e75eff64c29685c0cdabb7a2 # shrinks to edns_size = 1232, num_advances = 3

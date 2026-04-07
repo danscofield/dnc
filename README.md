@@ -115,6 +115,7 @@ crates/
       session.rs          # Session manager, state machine
       socks.rs            # SOCKS5 handshake and CONNECT parsing
       config.rs           # CLI argument parsing for both binaries
+      guard.rs            # Private network guard (CIDR-based address blocking)
       bin/
         socks_client.rs   # SOCKS5 proxy client binary
         exit_node.rs      # Exit node binary (standalone or embedded)
@@ -147,6 +148,7 @@ Each DNS message carries ~104 bytes of payload. The tunnel uses adaptive respons
 - Control frames (SYN/SYN-ACK/FIN/RST) authenticated with HMAC-SHA256 (truncated to 16 bytes)
 - PSK must be at least 32 bytes
 - Concurrent session limiter prevents resource exhaustion
+- Private network guard blocks outbound connections to RFC 1918, loopback, link-local, and cloud metadata ranges by default (SSRF protection)
 
 ## CLI reference
 
@@ -192,6 +194,8 @@ Each DNS message carries ~104 bytes of payload. The tunnel uses adaptive respons
 | `--backoff-max-ms` | value of `--poll-idle-ms` | Maximum backoff interval (ms) |
 | `--connect-timeout-ms` | `10000` | TCP connect timeout (ms) |
 | `--max-parallel-queries` | `8` | Parallel TXT queries per poll cycle |
+| `--allow-private-networks` | `false` | Disable default blocking of private/loopback/link-local ranges |
+| `--disallow-network` | — | Additional CIDR range to block (repeatable) |
 
 ### dns-message-broker
 

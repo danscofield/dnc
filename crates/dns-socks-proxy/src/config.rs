@@ -6,7 +6,11 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 
+use ipnet::IpNet;
+use tracing::info;
+
 use crate::crypto::Psk;
+use crate::guard::default_blocked_ranges;
 
 /// Errors arising from configuration parsing and validation.
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +38,9 @@ pub enum ConfigError {
 
     #[error("PSK validation failed: {0}")]
     PskValidation(#[from] crate::crypto::CryptoError),
+
+    #[error("invalid CIDR in --disallow-network: {value}: {source}")]
+    InvalidCidr { value: String, source: ipnet::AddrParseError },
 }
 
 /// Deployment mode for the exit-node.
@@ -293,6 +300,14 @@ pub struct ExitNodeCli {
     /// compatibility with recursive resolvers that truncate large UDP responses).
     #[arg(long)]
     pub no_edns: bool,
+
+    /// Disable default private-network blocking (allows RFC 1918, loopback, etc.).
+    #[arg(long)]
+    pub allow_private_networks: bool,
+
+    /// Additional CIDR ranges to block (repeatable).
+    #[arg(long = "disallow-network", value_name = "CIDR")]
+    pub disallow_networks: Vec<String>,
 }
 
 /// Validated configuration for the exit-node binary.
@@ -327,6 +342,8 @@ pub struct ExitNodeConfig {
     pub backoff_max: Duration,
     /// Whether to disable EDNS0 on TXT queries.
     pub no_edns: bool,
+    /// Active blocked CIDR ranges (computed from defaults + CLI flags).
+    pub blocked_networks: Vec<IpNet>,
 }
 
 impl ExitNodeCli {
@@ -354,6 +371,20 @@ impl ExitNodeCli {
             None => poll_idle,
         };
 
+        let mut blocked = if self.allow_private_networks {
+            info!("default private-network blocking disabled by --allow-private-networks");
+            vec![]
+        } else {
+            default_blocked_ranges()
+        };
+        for cidr_str in &self.disallow_networks {
+            let net: IpNet = cidr_str.parse().map_err(|e| ConfigError::InvalidCidr {
+                value: cidr_str.clone(),
+                source: e,
+            })?;
+            blocked.push(net);
+        }
+
         Ok(ExitNodeConfig {
             controlled_domain: self.domain,
             resolver_addr: self.resolver,
@@ -370,6 +401,7 @@ impl ExitNodeCli {
             max_parallel_queries: self.max_parallel_queries.max(1),
             backoff_max,
             no_edns: self.no_edns,
+            blocked_networks: blocked,
         })
     }
 }
@@ -543,6 +575,8 @@ mod tests {
             max_parallel_queries: 8,
             backoff_max_ms: None,
             no_edns: false,
+            allow_private_networks: false,
+            disallow_networks: vec![],
         }
     }
 
@@ -638,5 +672,50 @@ mod tests {
             DeploymentMode::from_str("embedded", true).unwrap(),
             DeploymentMode::Embedded
         );
+    }
+
+    // --- Guard config (blocked_networks) ---
+
+    #[test]
+    fn exit_node_default_blocked_networks() {
+        let cfg = base_exit_cli().into_config().unwrap();
+        assert_eq!(cfg.blocked_networks, default_blocked_ranges());
+    }
+
+    #[test]
+    fn exit_node_allow_private_networks_empties_defaults() {
+        let mut cli = base_exit_cli();
+        cli.allow_private_networks = true;
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.blocked_networks.is_empty());
+    }
+
+    #[test]
+    fn exit_node_disallow_network_adds_range() {
+        let mut cli = base_exit_cli();
+        cli.disallow_networks = vec!["203.0.113.0/24".into()];
+        let cfg = cli.into_config().unwrap();
+        let expected_extra: IpNet = "203.0.113.0/24".parse().unwrap();
+        assert!(cfg.blocked_networks.contains(&expected_extra));
+        // Should also contain the defaults
+        assert_eq!(cfg.blocked_networks.len(), default_blocked_ranges().len() + 1);
+    }
+
+    #[test]
+    fn exit_node_invalid_cidr_produces_error() {
+        let mut cli = base_exit_cli();
+        cli.disallow_networks = vec!["not-a-cidr".into()];
+        let result = cli.into_config();
+        assert!(matches!(result, Err(ConfigError::InvalidCidr { .. })));
+    }
+
+    #[test]
+    fn exit_node_allow_private_with_custom_ranges() {
+        let mut cli = base_exit_cli();
+        cli.allow_private_networks = true;
+        cli.disallow_networks = vec!["203.0.113.0/24".into()];
+        let cfg = cli.into_config().unwrap();
+        let expected: IpNet = "203.0.113.0/24".parse().unwrap();
+        assert_eq!(cfg.blocked_networks, vec![expected]);
     }
 }

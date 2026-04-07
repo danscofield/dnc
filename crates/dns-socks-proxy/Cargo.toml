@@ -19,6 +19,7 @@ thiserror = "2"
 async-trait = "0.1"
 data-encoding = "2"
 hickory-proto = "0.25"
+ipnet = "2"
 
 [dev-dependencies]
 proptest = "1"

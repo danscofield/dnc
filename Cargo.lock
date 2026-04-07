@@ -357,6 +357,7 @@ dependencies = [
  "hickory-proto",
  "hkdf",
  "hmac",
+ "ipnet",
  "proptest",
  "rand 0.8.5",
  "sha2",
