@@ -443,6 +443,371 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// smoltcp Tuning
+// ---------------------------------------------------------------------------
+
+/// Tuning parameters for the smoltcp TCP stack.
+pub struct SmolTuningConfig {
+    /// Initial retransmission timeout (default: 3000ms).
+    pub initial_rto: Duration,
+    /// TCP window size in MSS multiples (default: 4).
+    pub window_segments: usize,
+    /// Override MSS; None = auto-compute from DNS payload budget.
+    pub mss: Option<usize>,
+}
+
+impl Default for SmolTuningConfig {
+    fn default() -> Self {
+        Self {
+            initial_rto: Duration::from_millis(3000),
+            window_segments: 4,
+            mss: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Smol Client
+// ---------------------------------------------------------------------------
+
+/// CLI arguments for the smol-client binary.
+#[derive(Parser, Debug)]
+#[command(name = "smol-client", version, about = "SOCKS5 proxy client that tunnels TCP traffic over DNS using smoltcp")]
+pub struct SmolClientCli {
+    /// Local listen address (default: 127.0.0.1).
+    #[arg(long, default_value = "127.0.0.1")]
+    pub listen_addr: IpAddr,
+
+    /// Local listen port (default: 1080).
+    #[arg(long, default_value_t = 1080)]
+    pub listen_port: u16,
+
+    /// Controlled DNS domain (e.g. "tunnel.example.com").
+    #[arg(long)]
+    pub domain: String,
+
+    /// DNS resolver (or direct Broker) address, e.g. "127.0.0.1:5353".
+    #[arg(long)]
+    pub resolver: SocketAddr,
+
+    /// Client identifier used as sender_id in DNS queries.
+    #[arg(long)]
+    pub client_id: String,
+
+    /// Exit node identifier. Determines the control channel (`ctl-<exit_node_id>`)
+    /// that the client sends Init frames to and polls for InitAck responses.
+    /// Must match the `--node-id` configured on the smol-exit.
+    #[arg(long)]
+    pub exit_node_id: String,
+
+    /// Pre-shared key as a hex-encoded string.
+    #[arg(long, group = "psk_source")]
+    pub psk: Option<String>,
+
+    /// Path to a file containing the raw PSK bytes.
+    #[arg(long, group = "psk_source")]
+    pub psk_file: Option<PathBuf>,
+
+    /// Active poll interval in milliseconds (default: 50).
+    #[arg(long, default_value_t = 50)]
+    pub poll_active_ms: u64,
+
+    /// Idle poll interval in milliseconds (default: 500).
+    #[arg(long, default_value_t = 500)]
+    pub poll_idle_ms: u64,
+
+    /// Session setup timeout in milliseconds (default: 30000).
+    #[arg(long, default_value_t = 30000)]
+    pub connect_timeout_ms: u64,
+
+    /// Maximum backoff interval in milliseconds (default: value of poll_idle_ms).
+    #[arg(long)]
+    pub backoff_max_ms: Option<u64>,
+
+    /// Maximum number of concurrent active sessions (default: 8).
+    #[arg(long, default_value_t = 8)]
+    pub max_concurrent_sessions: usize,
+
+    /// Queue timeout in milliseconds for waiting connections (default: 30000).
+    /// Set to 0 to reject immediately when all permits are in use.
+    #[arg(long, default_value_t = 30000)]
+    pub queue_timeout_ms: u64,
+
+    /// Minimum interval between DNS queries in milliseconds (default: 0 = no throttle).
+    /// Helps avoid rate limiting by recursive resolvers.
+    #[arg(long, default_value_t = 0)]
+    pub query_interval_ms: u64,
+
+    /// Disable EDNS0 OPT record on TXT queries.
+    #[arg(long)]
+    pub no_edns: bool,
+
+    /// smoltcp initial RTO in milliseconds (default: 3000).
+    #[arg(long, default_value_t = 3000)]
+    pub smol_rto_ms: u64,
+
+    /// smoltcp TCP window size in MSS multiples (default: 4).
+    #[arg(long, default_value_t = 4)]
+    pub smol_window_segments: usize,
+
+    /// Override smoltcp MSS (default: auto-computed from DNS payload budget).
+    #[arg(long)]
+    pub smol_mss: Option<usize>,
+}
+
+/// Validated configuration for the smol-client binary.
+pub struct SmolClientConfig {
+    /// Local listen address.
+    pub listen_addr: IpAddr,
+    /// Local listen port.
+    pub listen_port: u16,
+    /// Controlled DNS domain.
+    pub controlled_domain: String,
+    /// DNS resolver address.
+    pub resolver_addr: SocketAddr,
+    /// Client identifier.
+    pub client_id: String,
+    /// Exit node identifier (determines the control channel).
+    pub exit_node_id: String,
+    /// Pre-shared key (≥ 32 bytes).
+    pub psk: Psk,
+    /// Active poll interval.
+    pub poll_active: Duration,
+    /// Idle poll interval.
+    pub poll_idle: Duration,
+    /// Session setup timeout.
+    pub connect_timeout: Duration,
+    /// Maximum backoff interval.
+    pub backoff_max: Duration,
+    /// Maximum number of concurrent active sessions.
+    pub max_concurrent_sessions: usize,
+    /// Queue timeout for waiting connections.
+    pub queue_timeout: Duration,
+    /// Minimum interval between DNS queries.
+    pub query_interval: Duration,
+    /// Whether to disable EDNS0 on TXT queries.
+    pub no_edns: bool,
+    /// smoltcp tuning parameters.
+    pub smol_tuning: SmolTuningConfig,
+}
+
+impl SmolClientCli {
+    /// Parse CLI arguments and validate into a `SmolClientConfig`.
+    pub fn into_config(self) -> Result<SmolClientConfig, ConfigError> {
+        if self.max_concurrent_sessions < 1 {
+            return Err(ConfigError::InvalidMaxConcurrentSessions {
+                got: self.max_concurrent_sessions,
+            });
+        }
+
+        let psk = resolve_psk(self.psk.as_deref(), self.psk_file.as_deref())?;
+        let poll_idle = Duration::from_millis(self.poll_idle_ms);
+        let backoff_max = match self.backoff_max_ms {
+            Some(ms) => Duration::from_millis(ms),
+            None => poll_idle,
+        };
+
+        Ok(SmolClientConfig {
+            listen_addr: self.listen_addr,
+            listen_port: self.listen_port,
+            controlled_domain: self.domain,
+            resolver_addr: self.resolver,
+            client_id: self.client_id,
+            exit_node_id: self.exit_node_id,
+            psk,
+            poll_active: Duration::from_millis(self.poll_active_ms),
+            poll_idle,
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            backoff_max,
+            max_concurrent_sessions: self.max_concurrent_sessions,
+            queue_timeout: Duration::from_millis(self.queue_timeout_ms),
+            query_interval: Duration::from_millis(self.query_interval_ms),
+            no_edns: self.no_edns,
+            smol_tuning: SmolTuningConfig {
+                initial_rto: Duration::from_millis(self.smol_rto_ms),
+                window_segments: self.smol_window_segments,
+                mss: self.smol_mss,
+            },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Smol Exit
+// ---------------------------------------------------------------------------
+
+/// CLI arguments for the smol-exit binary.
+#[derive(Parser, Debug)]
+#[command(name = "smol-exit", version, about = "Exit node that terminates DNS-tunneled TCP connections using smoltcp")]
+pub struct SmolExitCli {
+    /// Controlled DNS domain (e.g. "tunnel.example.com").
+    #[arg(long)]
+    pub domain: String,
+
+    /// DNS resolver address. Required in standalone mode.
+    #[arg(long)]
+    pub resolver: Option<SocketAddr>,
+
+    /// Node identifier used as sender_id.
+    #[arg(long)]
+    pub node_id: String,
+
+    /// Pre-shared key as a hex-encoded string.
+    #[arg(long, group = "psk_source")]
+    pub psk: Option<String>,
+
+    /// Path to a file containing the raw PSK bytes.
+    #[arg(long, group = "psk_source")]
+    pub psk_file: Option<PathBuf>,
+
+    /// Deployment mode: standalone or embedded (default: standalone).
+    #[arg(long, value_enum, default_value_t = DeploymentMode::Standalone)]
+    pub mode: DeploymentMode,
+
+    /// Path to Broker TOML config file. Required in embedded mode.
+    #[arg(long)]
+    pub broker_config: Option<PathBuf>,
+
+    /// Active poll interval in milliseconds (default: 50).
+    #[arg(long, default_value_t = 50)]
+    pub poll_active_ms: u64,
+
+    /// Idle poll interval in milliseconds (default: 500).
+    #[arg(long, default_value_t = 500)]
+    pub poll_idle_ms: u64,
+
+    /// TCP connect timeout in milliseconds (default: 10000).
+    #[arg(long, default_value_t = 10000)]
+    pub connect_timeout_ms: u64,
+
+    /// Maximum backoff interval in milliseconds (default: value of poll_idle_ms).
+    #[arg(long)]
+    pub backoff_max_ms: Option<u64>,
+
+    /// Disable EDNS0 OPT record on TXT queries.
+    #[arg(long)]
+    pub no_edns: bool,
+
+    /// Disable default private-network blocking (allows RFC 1918, loopback, etc.).
+    #[arg(long)]
+    pub allow_private_networks: bool,
+
+    /// Additional CIDR ranges to block (repeatable).
+    #[arg(long = "disallow-network", value_name = "CIDR")]
+    pub disallow_networks: Vec<String>,
+
+    /// Minimum interval between DNS queries in milliseconds (default: 0 = no throttle).
+    #[arg(long, default_value_t = 0)]
+    pub query_interval_ms: u64,
+
+    /// smoltcp initial RTO in milliseconds (default: 3000).
+    #[arg(long, default_value_t = 3000)]
+    pub smol_rto_ms: u64,
+
+    /// smoltcp TCP window size in MSS multiples (default: 4).
+    #[arg(long, default_value_t = 4)]
+    pub smol_window_segments: usize,
+
+    /// Override smoltcp MSS (default: auto-computed from DNS payload budget).
+    #[arg(long)]
+    pub smol_mss: Option<usize>,
+}
+
+/// Validated configuration for the smol-exit binary.
+pub struct SmolExitConfig {
+    /// Controlled DNS domain.
+    pub controlled_domain: String,
+    /// DNS resolver address (required in standalone mode).
+    pub resolver_addr: Option<SocketAddr>,
+    /// Node identifier.
+    pub node_id: String,
+    /// Pre-shared key (≥ 32 bytes).
+    pub psk: Psk,
+    /// Deployment mode.
+    pub mode: DeploymentMode,
+    /// Path to Broker TOML config (required in embedded mode).
+    pub broker_config_path: Option<PathBuf>,
+    /// Active poll interval.
+    pub poll_active: Duration,
+    /// Idle poll interval.
+    pub poll_idle: Duration,
+    /// TCP connect timeout.
+    pub connect_timeout: Duration,
+    /// Maximum backoff interval.
+    pub backoff_max: Duration,
+    /// Whether to disable EDNS0 on TXT queries.
+    pub no_edns: bool,
+    /// Active blocked CIDR ranges.
+    pub blocked_networks: Vec<IpNet>,
+    /// Minimum interval between DNS queries.
+    pub query_interval: Duration,
+    /// smoltcp tuning parameters.
+    pub smol_tuning: SmolTuningConfig,
+}
+
+impl SmolExitCli {
+    /// Parse CLI arguments and validate into a `SmolExitConfig`.
+    pub fn into_config(self) -> Result<SmolExitConfig, ConfigError> {
+        let psk = resolve_psk(self.psk.as_deref(), self.psk_file.as_deref())?;
+
+        // Mode-specific validation.
+        match self.mode {
+            DeploymentMode::Embedded => {
+                if self.broker_config.is_none() {
+                    return Err(ConfigError::BrokerConfigRequired);
+                }
+            }
+            DeploymentMode::Standalone => {
+                if self.resolver.is_none() {
+                    return Err(ConfigError::ResolverRequired);
+                }
+            }
+        }
+
+        let poll_idle = Duration::from_millis(self.poll_idle_ms);
+        let backoff_max = match self.backoff_max_ms {
+            Some(ms) => Duration::from_millis(ms),
+            None => poll_idle,
+        };
+
+        let mut blocked = if self.allow_private_networks {
+            info!("default private-network blocking disabled by --allow-private-networks");
+            vec![]
+        } else {
+            default_blocked_ranges()
+        };
+        for cidr_str in &self.disallow_networks {
+            let net: IpNet = cidr_str.parse().map_err(|e| ConfigError::InvalidCidr {
+                value: cidr_str.clone(),
+                source: e,
+            })?;
+            blocked.push(net);
+        }
+
+        Ok(SmolExitConfig {
+            controlled_domain: self.domain,
+            resolver_addr: self.resolver,
+            node_id: self.node_id,
+            psk,
+            mode: self.mode,
+            broker_config_path: self.broker_config,
+            poll_active: Duration::from_millis(self.poll_active_ms),
+            poll_idle,
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            backoff_max,
+            no_edns: self.no_edns,
+            blocked_networks: blocked,
+            query_interval: Duration::from_millis(self.query_interval_ms),
+            smol_tuning: SmolTuningConfig {
+                initial_rto: Duration::from_millis(self.smol_rto_ms),
+                window_segments: self.smol_window_segments,
+                mss: self.smol_mss,
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,5 +1082,232 @@ mod tests {
         let cfg = cli.into_config().unwrap();
         let expected: IpNet = "203.0.113.0/24".parse().unwrap();
         assert_eq!(cfg.blocked_networks, vec![expected]);
+    }
+
+    // --- SmolTuningConfig ---
+
+    #[test]
+    fn smol_tuning_config_defaults() {
+        let cfg = SmolTuningConfig::default();
+        assert_eq!(cfg.initial_rto, Duration::from_millis(3000));
+        assert_eq!(cfg.window_segments, 4);
+        assert_eq!(cfg.mss, None);
+    }
+
+    // --- SmolClientCli ---
+
+    fn base_smol_client_cli() -> SmolClientCli {
+        SmolClientCli {
+            listen_addr: "127.0.0.1".parse().unwrap(),
+            listen_port: 1080,
+            domain: "tunnel.example.com".into(),
+            resolver: "127.0.0.1:5353".parse().unwrap(),
+            client_id: "myclient".into(),
+            exit_node_id: "mynode".into(),
+            psk: Some("aa".repeat(32)),
+            psk_file: None,
+            poll_active_ms: 50,
+            poll_idle_ms: 500,
+            connect_timeout_ms: 30000,
+            backoff_max_ms: None,
+            max_concurrent_sessions: 8,
+            queue_timeout_ms: 30000,
+            query_interval_ms: 0,
+            no_edns: false,
+            smol_rto_ms: 3000,
+            smol_window_segments: 4,
+            smol_mss: None,
+        }
+    }
+
+    #[test]
+    fn smol_client_config_defaults() {
+        let cfg = base_smol_client_cli().into_config().unwrap();
+        assert_eq!(cfg.listen_addr, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(cfg.listen_port, 1080);
+        assert_eq!(cfg.controlled_domain, "tunnel.example.com");
+        assert_eq!(cfg.poll_active, Duration::from_millis(50));
+        assert_eq!(cfg.poll_idle, Duration::from_millis(500));
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.max_concurrent_sessions, 8);
+        assert_eq!(cfg.smol_tuning.initial_rto, Duration::from_millis(3000));
+        assert_eq!(cfg.smol_tuning.window_segments, 4);
+        assert_eq!(cfg.smol_tuning.mss, None);
+    }
+
+    #[test]
+    fn smol_client_config_custom_tuning() {
+        let mut cli = base_smol_client_cli();
+        cli.smol_rto_ms = 5000;
+        cli.smol_window_segments = 8;
+        cli.smol_mss = Some(100);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.smol_tuning.initial_rto, Duration::from_millis(5000));
+        assert_eq!(cfg.smol_tuning.window_segments, 8);
+        assert_eq!(cfg.smol_tuning.mss, Some(100));
+    }
+
+    #[test]
+    fn smol_client_config_no_psk() {
+        let mut cli = base_smol_client_cli();
+        cli.psk = None;
+        cli.psk_file = None;
+        assert!(cli.into_config().is_err());
+    }
+
+    #[test]
+    fn smol_client_zero_concurrent_sessions_rejected() {
+        let mut cli = base_smol_client_cli();
+        cli.max_concurrent_sessions = 0;
+        let result = cli.into_config();
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidMaxConcurrentSessions { got: 0 })
+        ));
+    }
+
+    #[test]
+    fn smol_client_backoff_defaults_to_poll_idle() {
+        let cfg = base_smol_client_cli().into_config().unwrap();
+        assert_eq!(cfg.backoff_max, cfg.poll_idle);
+    }
+
+    #[test]
+    fn smol_client_backoff_override() {
+        let mut cli = base_smol_client_cli();
+        cli.backoff_max_ms = Some(2000);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.backoff_max, Duration::from_millis(2000));
+    }
+
+    // --- SmolExitCli ---
+
+    fn base_smol_exit_cli() -> SmolExitCli {
+        SmolExitCli {
+            domain: "tunnel.example.com".into(),
+            resolver: Some("127.0.0.1:5353".parse().unwrap()),
+            node_id: "mynode".into(),
+            psk: Some("bb".repeat(32)),
+            psk_file: None,
+            mode: DeploymentMode::Standalone,
+            broker_config: None,
+            poll_active_ms: 50,
+            poll_idle_ms: 500,
+            connect_timeout_ms: 10000,
+            backoff_max_ms: None,
+            no_edns: false,
+            allow_private_networks: false,
+            disallow_networks: vec![],
+            query_interval_ms: 0,
+            smol_rto_ms: 3000,
+            smol_window_segments: 4,
+            smol_mss: None,
+        }
+    }
+
+    #[test]
+    fn smol_exit_config_standalone() {
+        let cfg = base_smol_exit_cli().into_config().unwrap();
+        assert_eq!(cfg.mode, DeploymentMode::Standalone);
+        assert!(cfg.resolver_addr.is_some());
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.smol_tuning.initial_rto, Duration::from_millis(3000));
+        assert_eq!(cfg.smol_tuning.window_segments, 4);
+        assert_eq!(cfg.smol_tuning.mss, None);
+    }
+
+    #[test]
+    fn smol_exit_config_custom_tuning() {
+        let mut cli = base_smol_exit_cli();
+        cli.smol_rto_ms = 5000;
+        cli.smol_window_segments = 8;
+        cli.smol_mss = Some(100);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.smol_tuning.initial_rto, Duration::from_millis(5000));
+        assert_eq!(cfg.smol_tuning.window_segments, 8);
+        assert_eq!(cfg.smol_tuning.mss, Some(100));
+    }
+
+    #[test]
+    fn smol_exit_standalone_requires_resolver() {
+        let mut cli = base_smol_exit_cli();
+        cli.resolver = None;
+        let result = cli.into_config();
+        assert!(matches!(result, Err(ConfigError::ResolverRequired)));
+    }
+
+    #[test]
+    fn smol_exit_embedded_requires_broker_config() {
+        let mut cli = base_smol_exit_cli();
+        cli.mode = DeploymentMode::Embedded;
+        cli.resolver = None;
+        cli.broker_config = None;
+        let result = cli.into_config();
+        assert!(matches!(result, Err(ConfigError::BrokerConfigRequired)));
+    }
+
+    #[test]
+    fn smol_exit_embedded_with_broker_config() {
+        let mut cli = base_smol_exit_cli();
+        cli.mode = DeploymentMode::Embedded;
+        cli.resolver = None;
+        cli.broker_config = Some(PathBuf::from("/etc/broker.toml"));
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.mode, DeploymentMode::Embedded);
+        assert_eq!(cfg.broker_config_path, Some(PathBuf::from("/etc/broker.toml")));
+    }
+
+    #[test]
+    fn smol_exit_config_no_psk() {
+        let mut cli = base_smol_exit_cli();
+        cli.psk = None;
+        cli.psk_file = None;
+        assert!(cli.into_config().is_err());
+    }
+
+    #[test]
+    fn smol_exit_default_blocked_networks() {
+        let cfg = base_smol_exit_cli().into_config().unwrap();
+        assert_eq!(cfg.blocked_networks, default_blocked_ranges());
+    }
+
+    #[test]
+    fn smol_exit_allow_private_networks() {
+        let mut cli = base_smol_exit_cli();
+        cli.allow_private_networks = true;
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.blocked_networks.is_empty());
+    }
+
+    #[test]
+    fn smol_exit_disallow_network_adds_range() {
+        let mut cli = base_smol_exit_cli();
+        cli.disallow_networks = vec!["203.0.113.0/24".into()];
+        let cfg = cli.into_config().unwrap();
+        let expected_extra: IpNet = "203.0.113.0/24".parse().unwrap();
+        assert!(cfg.blocked_networks.contains(&expected_extra));
+        assert_eq!(cfg.blocked_networks.len(), default_blocked_ranges().len() + 1);
+    }
+
+    #[test]
+    fn smol_exit_invalid_cidr_produces_error() {
+        let mut cli = base_smol_exit_cli();
+        cli.disallow_networks = vec!["not-a-cidr".into()];
+        let result = cli.into_config();
+        assert!(matches!(result, Err(ConfigError::InvalidCidr { .. })));
+    }
+
+    #[test]
+    fn smol_exit_backoff_defaults_to_poll_idle() {
+        let cfg = base_smol_exit_cli().into_config().unwrap();
+        assert_eq!(cfg.backoff_max, cfg.poll_idle);
+    }
+
+    #[test]
+    fn smol_exit_query_interval() {
+        let mut cli = base_smol_exit_cli();
+        cli.query_interval_ms = 100;
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.query_interval, Duration::from_millis(100));
     }
 }

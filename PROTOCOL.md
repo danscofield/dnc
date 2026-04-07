@@ -1,6 +1,6 @@
 # Protocol
 
-This document describes the wire protocol used by the DNS tunnel system. The protocol has two layers: a base messaging layer (used by all components including `dnc`) and a tunnel session layer (used by `socks-client` and `exit-node`).
+This document describes the wire protocol used by the DNS tunnel system. The protocol has three layers: a base messaging layer (used by all components including `dnc`), a tunnel session layer (used by `socks-client` and `exit-node`), and an alternative smoltcp tunnel layer (used by `smol-client` and `smol-exit`).
 
 ## Base Layer: DNS Message Broker
 
@@ -253,6 +253,147 @@ The exit node supports two deployment modes:
 | Embedded | `DirectTransport` | Runs the broker in-process, calls the store directly |
 
 `DirectTransport` uses non-destructive reads (`peek_many` with replay) since the client polls through a recursive resolver where UDP responses can be lost. `DnsTransport` also uses non-destructive reads with replay. Both transports support cursor-based replay advancement — the client tracks the highest store sequence from broker responses and passes `max_store_seq + 1` as the cursor on subsequent polls to prune confirmed replay entries.
+
+## smoltcp Tunnel Session Layer
+
+An alternative tunnel implementation using [smoltcp](https://github.com/smoltcp-rs/smoltcp), a userspace TCP/IP stack. Uses the same base messaging layer and encryption as the standard tunnel, but replaces the hand-rolled reliability protocol with a real TCP state machine. The smol binaries (smol-client, smol-exit) are not compatible with the standard binaries — they use different session setup messages and data framing.
+
+### Channels
+
+Same channel structure as the standard tunnel:
+
+| Channel | Format | Purpose |
+|---------|--------|---------|
+| Control | `ctl-<node_id>` | Session setup (Init, InitAck, Teardown) |
+| Upstream | `u-<session_id>` | Client → exit node encrypted IP packets |
+| Downstream | `d-<session_id>` | Exit node → client encrypted IP packets |
+
+### Session Setup Messages
+
+The smol tunnel uses a different set of control messages (distinct from the standard SYN/SYN-ACK):
+
+#### Init (0x10)
+
+Sent by smol-client on `ctl-<exit_node_id>`:
+
+```
+Offset  Size  Field
+0       1     msg_type (0x10)
+1       8     session_id
+9       1     addr_type (0x01=IPv4, 0x03=Domain, 0x04=IPv6)
+10      var   address
+var     2     target_port (big-endian)
+var     32    x25519_public_key
+var     1     client_id_len
+var     var   client_id (ASCII)
+```
+
+Followed by 16-byte HMAC-SHA256 MAC (truncated, using PSK).
+
+#### InitAck (0x11)
+
+Sent by smol-exit on `ctl-<client_id>`:
+
+```
+Offset  Size  Field
+0       1     msg_type (0x11)
+1       8     session_id
+9       32    x25519_public_key
+```
+
+Followed by 16-byte HMAC-SHA256 MAC.
+
+#### Teardown (0x12)
+
+Sent by either side on the peer's control channel:
+
+```
+Offset  Size  Field
+0       1     msg_type (0x12)
+1       8     session_id
+```
+
+Followed by 16-byte HMAC-SHA256 MAC.
+
+### Key Exchange
+
+Identical to the standard tunnel — X25519 ephemeral keys, HKDF-SHA256 with PSK, same `data_key` and `control_key` derivation.
+
+### Encrypted IP Packet Framing
+
+After session setup, smoltcp produces raw IPv4 packets. Each packet is encrypted and framed:
+
+```
+Offset  Size  Field
+0       8     session_id
+8       4     seq (big-endian u32, monotonically increasing)
+12      var   ChaCha20-Poly1305 ciphertext (IP packet + 16-byte auth tag)
+```
+
+Total overhead: 12 bytes header + 16 bytes auth tag = 28 bytes per packet.
+
+Encryption uses the same `data_key` and nonce construction as the standard tunnel:
+- Nonce: `[direction, 0, 0, 0, seq_be32, 0, 0, 0, 0]`
+- Direction: `0x00` = upstream, `0x01` = downstream
+
+### Virtual Network
+
+Each session creates a point-to-point virtual IP network:
+
+| Role | Virtual IP | Purpose |
+|------|-----------|---------|
+| smol-client | `192.168.69.1` | Client-side smoltcp interface |
+| smol-exit | `192.168.69.2` | Exit-side smoltcp interface |
+
+The client's smoltcp TCP socket connects to `192.168.69.2:4321`. The exit's smoltcp TCP socket listens on `192.168.69.2:4321`. One TCP connection per smoltcp Interface — the virtual IPs are reused across sessions since each session has its own isolated Interface.
+
+### MTU and MSS
+
+```
+dns_payload_budget = compute_payload_budget(domain_len, sender_id_len, channel_len, nonce_len)
+mtu = dns_payload_budget - 28 (session_id + seq + auth tag)
+mss = mtu - 40 (20 IPv4 header + 20 TCP header)
+```
+
+With a typical short domain: budget ~105 bytes, MTU ~77 bytes, MSS ~37 bytes.
+
+Socket buffers are set to `max(mss * window_segments, 384)` bytes for both send and receive.
+
+### Poll Architecture
+
+The smol poll loop uses three concurrent tasks per session:
+
+1. **Recv task** (spawned) — continuously polls the broker for inbound encrypted packets via its own dedicated `DnsTransport` (separate UDP socket). Decrypts IP packets and feeds them through an mpsc channel.
+2. **Send task** (spawned) — reads encrypted packets from an mpsc channel and sends them via DNS. Each send is a blocking DNS round-trip but doesn't block the main loop.
+3. **Main loop** — drains the inbound channel (non-blocking `try_recv`), calls `Interface::poll`, enqueues outbound packets (non-blocking `try_send`), and shuttles data between the smoltcp TCP socket and the local stream.
+
+The recv and send tasks use separate `DnsTransport` instances (separate UDP sockets) to avoid response cross-contamination between A queries (send) and TXT queries (recv).
+
+### Session Lifecycle
+
+```
+Client                              Exit Node
+  |                                    |
+  |--- Init (target, pubkey, cid) ---->| (on ctl-<exit_node_id>)
+  |                                    |--- TCP connect to target
+  |<--- InitAck (pubkey) -------------|  (on ctl-<client_id>)
+  |                                    |
+  | smoltcp TCP SYN =================>|  (encrypted IP packets on u-<sid>)
+  |<================ smoltcp TCP SYN-ACK  (encrypted IP packets on d-<sid>)
+  | smoltcp TCP ACK =================>|
+  |                                    |
+  |=== encrypted IP packets =========>|--- forward TCP data to target
+  |<== encrypted IP packets ===========|<-- response from target
+  |                                    |
+  | smoltcp TCP FIN =================>|  (deferred until data drained)
+  |<================ smoltcp TCP FIN  |
+  |                                    |
+  |--- Teardown --------------------->|  (on ctl-<exit_node_id>)
+```
+
+### Cursor Advancement
+
+All broker channel reads use cursor-based advancement (`cursor + 1` after each batch) to avoid re-reading consumed messages. This is critical for the smol tunnel because smoltcp's retransmissions generate many packets — without cursor advancement, the same packets would be re-processed indefinitely.
 
 ## dnc Stream Framing
 

@@ -6,3 +6,6 @@ pub mod session;
 pub mod socks;
 pub mod config;
 pub mod guard;
+pub mod smol_device;
+pub mod smol_frame;
+pub mod smol_poll;

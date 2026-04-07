@@ -20,6 +20,7 @@ async-trait = "0.1"
 data-encoding = "2"
 hickory-proto = "0.25"
 ipnet = "2"
+smoltcp = { version = "0.12", features = ["medium-ip", "proto-ipv4", "socket-tcp", "alloc"], default-features = false }
 
 [dev-dependencies]
 proptest = "1"
@@ -31,3 +32,11 @@ path = "src/bin/socks_client.rs"
 [[bin]]
 name = "exit-node"
 path = "src/bin/exit_node.rs"
+
+[[bin]]
+name = "smol-client"
+path = "src/bin/smol_client.rs"
+
+[[bin]]
+name = "smol-exit"
+path = "src/bin/smol_exit.rs"
