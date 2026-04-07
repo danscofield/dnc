@@ -39,6 +39,11 @@ impl Device for VirtualDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
+        // Disable checksum validation/generation — packets traverse an
+        // encrypted tunnel, not a real network, so hardware offload
+        // semantics don't apply. Both sides use the same virtual device,
+        // so checksums are either both computed or both skipped.
+        caps.checksum = smoltcp::phy::ChecksumCapabilities::ignored();
         caps
     }
 

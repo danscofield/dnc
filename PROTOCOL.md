@@ -395,6 +395,87 @@ Client                              Exit Node
 
 All broker channel reads use cursor-based advancement (`cursor + 1` after each batch) to avoid re-reading consumed messages. This is critical for the smol tunnel because smoltcp's retransmissions generate many packets — without cursor advancement, the same packets would be re-processed indefinitely.
 
+## Relay Mode
+
+An alternative deployment where the broker and exit node run in a single process (`dnsrelay`), using a `RelayStore` instead of the standard FIFO `ChannelStore`. The client binary is `dnssocksrelay`. Relay mode uses the same smoltcp tunnel session layer (Init/InitAck/Teardown, encrypted IP packets, same key exchange) but with a different store backend and a two-phase receive protocol.
+
+### RelayStore
+
+Unlike the standard broker's per-channel FIFO queue, the RelayStore uses a bounded ring buffer per (channel, sender_id) pair. Each write pushes to the ring buffer; when full (default 64 slots), the oldest entry is dropped. Reads are non-destructive — slots persist until they expire (configurable TTL) or are explicitly acknowledged.
+
+Each slot has:
+- `sender_id` — who wrote it
+- `payload` — raw bytes
+- `sequence` — monotonically increasing global counter
+- `timestamp` — Unix epoch seconds
+- `written_at` — wall-clock instant (for TTL expiry)
+
+### Relay Send (A query)
+
+Same as the base layer send path. The relay handler decodes the query, writes to the RelayStore, and returns ACK IP `1.2.3.4`.
+
+### Relay Status (A query)
+
+```
+<nonce>.status.<channel>.<controlled_domain>
+```
+
+Returns slot count encoded as `128.x.y.z` (lower 24 bits), or `0.0.0.0` for empty.
+
+### Relay Receive (TXT query) — Two-Phase Selective Fetch
+
+The relay receive path supports three modes, selected by the nonce prefix:
+
+#### Legacy Mode (no prefix)
+
+```
+<nonce>.<channel>.<controlled_domain>
+```
+
+Returns all non-expired envelopes sorted by sequence descending, budget-limited to fit the EDNS0 response size (~7 records at 1232 bytes). This is the backward-compatible path — identical to the original behavior.
+
+#### Manifest Mode (`m` prefix)
+
+```
+m<nonce>.<channel>.<controlled_domain>
+```
+
+Returns a compact list of all available (sequence_id, payload_length) pairs as comma-separated values in TXT records. Format: `seq1,len1,seq2,len2,...` packed into TXT records (up to 255 chars each). A single manifest response can list 50+ entries — far more than the ~7 full envelopes that fit in legacy mode.
+
+#### Fetch Mode (`f` prefix)
+
+```
+f<nonce>.<seq1>-<seq2>-<seq3>.<channel>.<controlled_domain>
+```
+
+The label after the nonce contains dash-separated decimal sequence IDs. The relay returns full envelopes only for those specific sequences, using the same `sender_id|seq|timestamp|base32_payload` format as legacy mode.
+
+The sequence IDs label must fit within the 63-char DNS label limit, so clients batch fetch requests (typically 5 IDs per query).
+
+#### Two-Phase Protocol Flow
+
+The client (`DedupRecvTransport`) uses the two-phase protocol automatically:
+
+1. **Manifest** — send `m`-prefixed TXT query, get all available sequence IDs
+2. **Filter** — remove already-seen sequences (tracked per-channel in a `HashSet<u64>`)
+3. **Fetch** — send `f`-prefixed TXT queries in batches of 5 for only the needed sequences
+4. **Skip** — if all manifest sequences are already seen, skip the fetch entirely (saves a round-trip)
+
+This solves the response budget crowding-out problem: when the ring buffer has 20+ slots, legacy mode can only return ~7 per poll. The manifest fits all 20 IDs in one response, and batched fetches retrieve exactly the ones the client needs.
+
+### Relay Acknowledgment
+
+After receiving envelopes, the client calls `store.ack_sequences(channel, &seq_ids)` to remove acknowledged slots from the ring buffer. This prevents indefinite re-delivery.
+
+### Relay Binaries
+
+| Binary | Role | Description |
+|--------|------|-------------|
+| `dnsrelay` | Server | Combined broker + exit node. Listens for DNS queries, routes to RelayStore, manages smoltcp sessions. |
+| `dnssocksrelay` | Client | SOCKS5 proxy client. Uses `DnsTransport` for send, `DedupRecvTransport` (wrapping `DnsTransport`) for two-phase receive. |
+
+Both use the same smoltcp tunnel session layer — Init/InitAck/Teardown on control channels, encrypted IP packets on data channels, same key exchange and encryption.
+
 ## dnc Stream Framing
 
 `dnc` adds a lightweight stream framing layer on top of the base messaging layer for transferring data larger than a single DNS message.

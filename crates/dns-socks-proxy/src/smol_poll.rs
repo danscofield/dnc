@@ -68,7 +68,7 @@ pub fn create_tcp_socket(
     let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; buf_size]);
     let tx_buf = smoltcp::socket::tcp::SocketBuffer::new(vec![0u8; buf_size]);
     let mut socket = smoltcp::socket::tcp::Socket::new(rx_buf, tx_buf);
-    socket.set_timeout(Some(smoltcp::time::Duration::from_secs(10)));
+    socket.set_timeout(Some(smoltcp::time::Duration::from_secs(30)));
     // Disable Nagle — send segments immediately, don't wait to coalesce.
     // On a high-latency DNS link, Nagle adds unnecessary delay.
     socket.set_nagle_enabled(false);
@@ -125,6 +125,8 @@ pub async fn run_session_poll_loop(
         let mut backoff = AdaptiveBackoff::new(recv_poll_active, recv_backoff_max);
         let mut cursor: Option<u64> = None;
         let mut poll_count: u64 = 0;
+        // LRU dedup: track hashes of recently-injected encrypted payloads
+        // to avoid re-injecting the same packet into smoltcp.
 
         loop {
             poll_count += 1;
@@ -146,7 +148,7 @@ pub async fn run_session_poll_loop(
                             for encrypted in &frames {
                                 match decrypt_ip_packet(encrypted, decrypt_dir, &decrypt_key) {
                                     Ok((_sid, _seq, ip_packet)) => {
-                                        debug!(ip_len = ip_packet.len(), "recv task: decrypted IP packet");
+                                        debug!(ip_len = ip_packet.len(), first_bytes = ?&ip_packet[..ip_packet.len().min(20)], "recv task: decrypted IP packet");
                                         if inbound_tx.send(ip_packet).await.is_err() {
                                             return;
                                         }
@@ -202,6 +204,9 @@ pub async fn run_session_poll_loop(
     let mut backoff = AdaptiveBackoff::new(config.poll_active, config.backoff_max);
     let mut local_eof = false;
     let mut loop_count: u64 = 0;
+    // Buffer for bytes read from the local stream that couldn't fit in
+    // smoltcp's send buffer on the previous iteration.
+    let mut pending_send: Vec<u8> = Vec::new();
 
     let result = loop {
         loop_count += 1;
@@ -213,10 +218,66 @@ pub async fn run_session_poll_loop(
         let mut activity = false;
 
         // --- Drain inbound channel (non-blocking) ---
+        // Inject packets one at a time with an iface.poll() between each,
+        // so smoltcp can process state transitions (e.g., SYN → SYN-RECEIVED
+        // → ESTABLISHED) before seeing subsequent data segments.
         let mut inbound_count = 0;
         while let Ok(ip_packet) = inbound_rx.try_recv() {
             inbound_count += 1;
+            // Log TCP flags for debugging relay mode issues.
+            if ip_packet.len() >= 34 {
+                let tcp_offset = ((ip_packet[0] & 0x0F) as usize) * 4;
+                if ip_packet.len() >= tcp_offset + 14 {
+                    let flags = ip_packet[tcp_offset + 13];
+                    let seq = u32::from_be_bytes([
+                        ip_packet[tcp_offset + 4],
+                        ip_packet[tcp_offset + 5],
+                        ip_packet[tcp_offset + 6],
+                        ip_packet[tcp_offset + 7],
+                    ]);
+                    let src_port = u16::from_be_bytes([ip_packet[tcp_offset], ip_packet[tcp_offset + 1]]);
+                    let dst_port = u16::from_be_bytes([ip_packet[tcp_offset + 2], ip_packet[tcp_offset + 3]]);
+                    let src_ip = format!("{}.{}.{}.{}", ip_packet[12], ip_packet[13], ip_packet[14], ip_packet[15]);
+                    let dst_ip = format!("{}.{}.{}.{}", ip_packet[16], ip_packet[17], ip_packet[18], ip_packet[19]);
+                    let data_offset = tcp_offset + ((ip_packet[tcp_offset + 12] >> 4) as usize) * 4;
+                    let payload_len = ip_packet.len().saturating_sub(data_offset);
+                    debug!(
+                        tcp_flags = format!("{:#04x}", flags),
+                        tcp_seq = seq,
+                        payload_len,
+                        ip_len = ip_packet.len(),
+                        %src_ip, %dst_ip, src_port, dst_port,
+                        "main loop: injecting IP packet"
+                    );
+                }
+            }
             device.inject_rx(ip_packet);
+            // Poll after each packet so smoltcp can process state transitions
+            // before seeing the next packet. Use a fresh timestamp each time.
+            let inject_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            iface.poll(smoltcp::time::Instant::from_millis(inject_now), device, sockets);
+            // Check if data became available after this packet.
+            {
+                let sock = sockets.get::<smoltcp::socket::tcp::Socket>(socket_handle);
+                let state = sock.state();
+                if sock.can_recv() {
+                    debug!(inbound_count, "inject: can_recv became true!");
+                }
+                if inbound_count <= 10 {
+                    debug!(
+                        ?state,
+                        can_recv = sock.can_recv(),
+                        can_send = sock.can_send(),
+                        may_recv = sock.may_recv(),
+                        may_send = sock.may_send(),
+                        inbound_count,
+                        "inject: socket state after poll"
+                    );
+                }
+            }
             activity = true;
         }
 
@@ -268,19 +329,42 @@ pub async fn run_session_poll_loop(
 
             // Local stream → smoltcp send buffer
             if !local_eof && socket.can_send() {
-                let mut buf = [0u8; 1024];
-                match tokio::time::timeout(Duration::from_millis(1), local_read.read(&mut buf))
-                    .await
-                {
+                // First, drain any pending bytes from a previous partial write.
+                if !pending_send.is_empty() {
+                    match socket.send_slice(&pending_send) {
+                        Ok(written) => {
+                            pending_send.drain(..written);
+                            if written > 0 {
+                                activity = true;
+                            }
+                        }
+                        Err(e) => {
+                            debug!("smoltcp send_slice error (pending): {e}");
+                        }
+                    }
+                }
+                // Then read new data if the pending buffer is empty.
+                if pending_send.is_empty() {
+                    let mut buf = [0u8; 1024];
+                    match tokio::time::timeout(Duration::from_millis(1), local_read.read(&mut buf))
+                        .await
+                    {
                     Ok(Ok(0)) => {
                         debug!("local stream EOF, stopping local reads");
                         local_eof = true;
                     }
                     Ok(Ok(n)) => {
-                        if let Err(e) = socket.send_slice(&buf[..n]) {
-                            debug!("smoltcp send_slice error: {e}");
-                        } else {
-                            activity = true;
+                        match socket.send_slice(&buf[..n]) {
+                            Ok(written) => {
+                                if written < n {
+                                    // Save unwritten bytes for next iteration.
+                                    pending_send.extend_from_slice(&buf[written..n]);
+                                }
+                                activity = true;
+                            }
+                            Err(e) => {
+                                debug!("smoltcp send_slice error: {e}");
+                            }
                         }
                     }
                     Ok(Err(e)) => {
@@ -289,6 +373,7 @@ pub async fn run_session_poll_loop(
                     }
                     Err(_) => {}
                 }
+                } // end if pending_send.is_empty()
             }
 
             // smoltcp recv buffer → local stream
@@ -341,9 +426,12 @@ pub async fn run_session_poll_loop(
         let poll_delay = iface
             .poll_delay(smol_now, sockets)
             .map(|d| Duration::from_millis(d.total_millis() as u64));
+        // Clamp sleep to poll_active so smoltcp timers (retransmission, etc.)
+        // always fire promptly. The backoff only affects how aggressively we
+        // poll the transport, not how often we service smoltcp.
         let sleep_dur = match poll_delay {
-            Some(hint) => adaptive.min(hint),
-            None => adaptive,
+            Some(hint) => adaptive.min(hint).min(config.poll_active),
+            None => adaptive.min(config.poll_active),
         };
 
         tokio::time::sleep(sleep_dur).await;

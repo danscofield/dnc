@@ -3,5 +3,7 @@ pub mod dns;
 pub mod encoding;
 pub mod error;
 pub mod handler;
+pub mod relay_handler;
+pub mod relay_store;
 pub mod server;
 pub mod store;

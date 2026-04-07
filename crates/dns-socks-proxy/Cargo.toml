@@ -40,3 +40,11 @@ path = "src/bin/smol_client.rs"
 [[bin]]
 name = "smol-exit"
 path = "src/bin/smol_exit.rs"
+
+[[bin]]
+name = "dnsrelay"
+path = "src/bin/dnsrelay.rs"
+
+[[bin]]
+name = "dnssocksrelay"
+path = "src/bin/dnssocksrelay.rs"

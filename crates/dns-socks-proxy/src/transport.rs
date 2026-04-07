@@ -132,6 +132,18 @@ pub trait TransportBackend: Send + Sync {
 
     /// Query the queue depth for a channel.
     async fn query_status(&self, channel: &str) -> Result<usize, TransportError>;
+
+    /// Receive a manifest of available sequence IDs and payload lengths.
+    /// Default: not supported, return empty.
+    async fn recv_manifest(&self, _channel: &str) -> Result<Vec<(u64, usize)>, TransportError> {
+        Ok(vec![])
+    }
+
+    /// Receive specific frames by sequence ID (selective fetch).
+    /// Default: fall back to recv_frames.
+    async fn recv_fetch(&self, channel: &str, _seq_ids: &[u64]) -> Result<(Vec<Vec<u8>>, Option<u64>), TransportError> {
+        self.recv_frames(channel, None).await
+    }
 }
 
 /// DNS-based transport: sends/receives via DNS A/TXT queries.
@@ -350,6 +362,40 @@ impl DnsTransport {
             .map_err(|e| TransportError::DnsProtocol(format!("invalid DNS name: {e}")))
     }
 
+    /// Build the manifest query name: `m<nonce>.<channel>.<domain>`
+    fn build_manifest_query_name(&self, channel: &str) -> Result<Name, TransportError> {
+        let nonce = format!("m{}", Self::generate_nonce());
+        let full_name = format!("{}.{}.{}.", nonce, channel, self.controlled_domain);
+
+        Name::from_ascii(&full_name)
+            .map_err(|e| TransportError::DnsProtocol(format!("invalid DNS name: {e}")))
+    }
+
+    /// Build the fetch query name: `f<nonce>.<seq1>-<seq2>-<seq3>.<channel>.<domain>`
+    ///
+    /// Sequence IDs are dash-separated decimal numbers in a single label.
+    /// Must fit within the 63-char DNS label limit.
+    fn build_fetch_query_name(&self, channel: &str, seq_ids: &[u64]) -> Result<Name, TransportError> {
+        let nonce = format!("f{}", Self::generate_nonce());
+        let seq_label: String = seq_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join("-");
+
+        if seq_label.len() > MAX_LABEL_LEN {
+            return Err(TransportError::DnsProtocol(format!(
+                "sequence IDs label exceeds {MAX_LABEL_LEN}-char DNS label limit: {} chars",
+                seq_label.len()
+            )));
+        }
+
+        let full_name = format!("{}.{}.{}.{}.", nonce, seq_label, channel, self.controlled_domain);
+
+        Name::from_ascii(&full_name)
+            .map_err(|e| TransportError::DnsProtocol(format!("invalid DNS name: {e}")))
+    }
+
     /// Build the receive query name: `<nonce>.<channel>.<domain>`
     ///
     /// When `cursor` is `Some`, the nonce includes a `-c<cursor>` suffix for
@@ -406,6 +452,68 @@ impl DnsTransport {
             }
         }
         Ok(results)
+    }
+
+    /// Send a manifest TXT query and parse the response into (seq_id, payload_len) pairs.
+    ///
+    /// The manifest response contains comma-separated `seq_id,payload_len` entries
+    /// packed into TXT records.
+    pub async fn recv_manifest(&self, channel: &str) -> Result<Vec<(u64, usize)>, TransportError> {
+        let query_name = self.build_manifest_query_name(channel)?;
+        let query_bytes = Self::build_dns_query(&query_name, RecordType::TXT, self.use_edns)?;
+        let response_bytes = self.send_dns_query(&query_bytes).await?;
+
+        let txt_records = Self::parse_txt_responses(&response_bytes)?;
+        if txt_records.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut entries = Vec::new();
+        for record in &txt_records {
+            // Each record contains comma-separated values: seq1,len1,seq2,len2,...
+            let tokens: Vec<&str> = record.split(',').collect();
+            // Process pairs of tokens
+            let mut i = 0;
+            while i + 1 < tokens.len() {
+                if let (Ok(seq_id), Ok(payload_len)) = (
+                    tokens[i].trim().parse::<u64>(),
+                    tokens[i + 1].trim().parse::<usize>(),
+                ) {
+                    entries.push((seq_id, payload_len));
+                }
+                i += 2;
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Send a selective fetch TXT query for specific sequence IDs and decode the envelopes.
+    ///
+    /// Returns `(frames, max_seq)` like `recv_frames`.
+    pub async fn recv_fetch(&self, channel: &str, seq_ids: &[u64]) -> Result<(Vec<Vec<u8>>, Option<u64>), TransportError> {
+        let query_name = self.build_fetch_query_name(channel, seq_ids)?;
+        let query_bytes = Self::build_dns_query(&query_name, RecordType::TXT, self.use_edns)?;
+        let response_bytes = self.send_dns_query(&query_bytes).await?;
+
+        let envelopes = Self::parse_txt_responses(&response_bytes)?;
+        if envelopes.is_empty() {
+            return Ok((vec![], None));
+        }
+
+        let mut frames = Vec::with_capacity(envelopes.len());
+        let mut max_seq: Option<u64> = None;
+        for envelope_str in envelopes {
+            match dns_message_broker::encoding::decode_envelope(&envelope_str) {
+                Ok(parts) => {
+                    max_seq = Some(max_seq.map_or(parts.sequence, |m: u64| m.max(parts.sequence)));
+                    frames.push(parts.payload);
+                }
+                Err(e) => {
+                    debug!("failed to decode envelope in fetch response: {e}");
+                }
+            }
+        }
+        Ok((frames, max_seq))
     }
 }
 
@@ -482,6 +590,16 @@ impl TransportBackend for DnsTransport {
         let response_bytes = self.send_dns_query(&query_bytes).await?;
         let ip = Self::parse_a_response(&response_bytes)?;
         decode_status_ip(ip)
+    }
+
+    async fn recv_manifest(&self, channel: &str) -> Result<Vec<(u64, usize)>, TransportError> {
+        // Delegate to the inherent method on DnsTransport
+        DnsTransport::recv_manifest(self, channel).await
+    }
+
+    async fn recv_fetch(&self, channel: &str, seq_ids: &[u64]) -> Result<(Vec<Vec<u8>>, Option<u64>), TransportError> {
+        // Delegate to the inherent method on DnsTransport
+        DnsTransport::recv_fetch(self, channel, seq_ids).await
     }
 }
 

@@ -12,6 +12,7 @@ There are two tunnel implementations that share the same broker, encryption, and
 
 - **socks-client / exit-node** — The original tunnel. Uses a minimal hand-rolled reliability layer (sliding window, retransmit buffer, SYN/ACK/FIN state machine). Intentionally keeps the state machine as simple as possible — just enough to get data through. No congestion control, no flow control, no out-of-order reassembly beyond the sliding window.
 - **smol-client / smol-exit** — Alternative tunnel using [smoltcp](https://github.com/smoltcp-rs/smoltcp), a userspace TCP/IP stack. The DNS channel is treated as a lossy datagram link carrying encrypted IP packets between two smoltcp instances. Gets a full TCP state machine — segmentation, retransmission, congestion control, flow control, FIN handshake — without needing a TUN device or root privileges.
+- **dnssocksrelay / dnsrelay** — Relay mode. The broker and exit node run in a single process (`dnsrelay`) using a ring-buffer-per-sender store instead of FIFO queues. The client (`dnssocksrelay`) uses a two-phase manifest+fetch protocol to selectively retrieve only the packets it needs, avoiding the response budget crowding-out problem that occurs when the ring buffer accumulates many slots. Uses the same smoltcp tunnel layer.
 
 Neither implementation is particularly reliable. The DNS channel is fundamentally hostile to TCP-like protocols: ~100-byte payloads, multi-second round-trips through recursive resolvers, store-and-forward message queues with finite capacity, and no guarantee of delivery order. Both implementations work for short request/response patterns (curl, API calls) but will struggle with sustained transfers or high concurrency. The hand-rolled version is more predictable because it was designed for this specific link. The smoltcp version is more correct but fights its own assumptions about how a network should behave.
 
@@ -169,16 +170,21 @@ crates/
       smol_device.rs      # smoltcp VirtualDevice (in-memory packet queues, MTU calc)
       smol_frame.rs       # Init/InitAck/Teardown messages, encrypted IP packet framing
       smol_poll.rs        # smoltcp Interface helpers, poll loop, PollDirection
+      relay_transport.rs  # RelayTransport (direct store), DedupRecvTransport (two-phase manifest+fetch)
       bin/
         socks_client.rs   # SOCKS5 proxy client (hand-rolled reliability)
         exit_node.rs      # Exit node (hand-rolled reliability)
         smol_client.rs    # SOCKS5 proxy client (smoltcp)
         smol_exit.rs      # Exit node (smoltcp)
+        dnssocksrelay.rs  # SOCKS5 proxy client (relay mode, smoltcp + selective fetch)
+        dnsrelay.rs       # Combined broker + exit node (relay mode)
 src/                      # DNS Message Broker
   lib.rs                  # Crate root, re-exports
   main.rs                 # Broker binary entry point
   server.rs               # UDP DNS server loop
   handler.rs              # Query routing (send via A, receive via TXT)
+  relay_handler.rs        # Relay query routing (manifest/fetch/legacy TXT modes)
+  relay_store.rs          # Per-sender ring buffer store with TTL expiry
   store.rs                # Per-channel FIFO message store with replay buffer
   encoding.rs             # Base32 encoding, envelope format
   dns.rs                  # DNS packet building/parsing

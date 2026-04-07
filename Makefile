@@ -5,6 +5,8 @@ SOCKS_CLIENT  := socks-client
 EXIT_NODE     := exit-node
 SMOL_CLIENT   := smol-client
 SMOL_EXIT     := smol-exit
+DNSRELAY      := dnsrelay
+DNSSOCKSRELAY := dnssocksrelay
 VERSION       := $(shell cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
 DIST          := dist
 
@@ -17,7 +19,7 @@ MACOS_ARM  := aarch64-apple-darwin
 .PHONY: all build test clean dist linux-x64 linux-arm macos-x64 macos-arm setup
 
 # Touch crate roots to force cargo to rebuild everything.
-TOUCH_SOURCES := src/lib.rs src/main.rs crates/dns-socks-proxy/src/lib.rs crates/dns-socks-proxy/src/bin/socks_client.rs crates/dns-socks-proxy/src/bin/exit_node.rs crates/dns-socks-proxy/src/bin/smol_client.rs crates/dns-socks-proxy/src/bin/smol_exit.rs examples/dnc.rs examples/dchat.rs
+TOUCH_SOURCES := src/lib.rs src/main.rs crates/dns-socks-proxy/src/lib.rs crates/dns-socks-proxy/src/bin/socks_client.rs crates/dns-socks-proxy/src/bin/exit_node.rs crates/dns-socks-proxy/src/bin/smol_client.rs crates/dns-socks-proxy/src/bin/smol_exit.rs crates/dns-socks-proxy/src/bin/dnsrelay.rs crates/dns-socks-proxy/src/bin/dnssocksrelay.rs examples/dnc.rs examples/dchat.rs
 
 all: build
 
@@ -44,6 +46,8 @@ define COPY_BINS
 	cp target/$(1)/release/$(EXIT_NODE) $(DIST)/$(1)/
 	cp target/$(1)/release/$(SMOL_CLIENT) $(DIST)/$(1)/
 	cp target/$(1)/release/$(SMOL_EXIT) $(DIST)/$(1)/
+	cp target/$(1)/release/$(DNSRELAY) $(DIST)/$(1)/
+	cp target/$(1)/release/$(DNSSOCKSRELAY) $(DIST)/$(1)/
 	@echo "Built: $(DIST)/$(1)/"
 endef
 
@@ -81,7 +85,8 @@ linux: linux-x64 linux-arm
 
 macos: macos-arm
 
-dist: linux macos
+# dist: linux macos
+dist: linux-x64 macos-arm
 	@echo ""
 	@echo "All builds in $(DIST)/:"
 	@ls -d $(DIST)/*/
@@ -103,6 +108,24 @@ tarball-macos-arm: macos-arm
 tarballs: tarball-linux-x64 tarball-linux-arm tarball-macos-x64 tarball-macos-arm
 	@echo ""
 	@ls -lh $(DIST)/*.tar.gz
+
+# --- Run relay (local testing) ---
+
+run-relay:
+	RUST_LOG=info cargo run -p dns-socks-proxy --bin dnsrelay -- \
+		--domain tunnel.example.com \
+		--listen 127.0.0.1:5353 \
+		--node-id relay1 \
+		--psk-file demo/psk.key \
+		--allow-private-networks
+
+run-relay-client:
+	RUST_LOG=info cargo run -p dns-socks-proxy --bin dnssocksrelay -- \
+		--domain tunnel.example.com \
+		--resolver 127.0.0.1:5353 \
+		--client-id client1 \
+		--exit-node-id relay1 \
+		--psk-file demo/psk.key
 
 clean:
 	cargo clean

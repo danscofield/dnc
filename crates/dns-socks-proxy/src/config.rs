@@ -808,6 +808,302 @@ impl SmolExitCli {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Relay (dnsrelay)
+// ---------------------------------------------------------------------------
+
+/// CLI arguments for the dnsrelay binary.
+#[derive(Parser, Debug)]
+#[command(name = "dnsrelay", version, about = "DNS relay server with integrated smoltcp exit node")]
+pub struct RelayCliArgs {
+    /// Controlled DNS domain (e.g. "tunnel.example.com").
+    #[arg(long)]
+    pub domain: String,
+
+    /// UDP bind address (default: 0.0.0.0:53).
+    #[arg(long, default_value = "0.0.0.0:53")]
+    pub listen: SocketAddr,
+
+    /// Node identifier used as sender_id.
+    #[arg(long)]
+    pub node_id: String,
+
+    /// Pre-shared key as a hex-encoded string.
+    #[arg(long, group = "psk_source")]
+    pub psk: Option<String>,
+
+    /// Path to a file containing the raw PSK bytes.
+    #[arg(long, group = "psk_source")]
+    pub psk_file: Option<PathBuf>,
+
+    /// Packet slot expiry TTL in seconds (default: 600).
+    #[arg(long, default_value_t = 600)]
+    pub message_ttl_secs: u64,
+
+    /// Expiry sweep interval in seconds (default: 30).
+    #[arg(long, default_value_t = 30)]
+    pub expiry_interval_secs: u64,
+
+    /// TCP connect timeout in milliseconds (default: 10000).
+    #[arg(long, default_value_t = 10000)]
+    pub connect_timeout_ms: u64,
+
+    /// Active poll interval in milliseconds (default: 50).
+    #[arg(long, default_value_t = 50)]
+    pub poll_active_ms: u64,
+
+    /// Idle poll interval in milliseconds (default: 500).
+    #[arg(long, default_value_t = 500)]
+    pub poll_idle_ms: u64,
+
+    /// smoltcp initial RTO in milliseconds (default: 3000).
+    #[arg(long, default_value_t = 3000)]
+    pub smol_rto_ms: u64,
+
+    /// smoltcp TCP window size in MSS multiples (default: 4).
+    #[arg(long, default_value_t = 4)]
+    pub smol_window_segments: usize,
+
+    /// Override smoltcp MSS (default: auto-computed from DNS payload budget).
+    #[arg(long)]
+    pub smol_mss: Option<usize>,
+
+    /// Disable default private-network blocking (allows RFC 1918, loopback, etc.).
+    #[arg(long)]
+    pub allow_private_networks: bool,
+
+    /// Additional CIDR ranges to block (repeatable).
+    #[arg(long = "disallow-network", value_name = "CIDR")]
+    pub disallow_networks: Vec<String>,
+}
+
+/// Validated configuration for the dnsrelay binary.
+pub struct RelayConfig {
+    /// Controlled DNS domain.
+    pub controlled_domain: String,
+    /// UDP bind address.
+    pub listen_addr: SocketAddr,
+    /// Node identifier.
+    pub node_id: String,
+    /// Pre-shared key (≥ 32 bytes).
+    pub psk: Psk,
+    /// Packet slot expiry TTL.
+    pub message_ttl: Duration,
+    /// Expiry sweep interval.
+    pub expiry_interval: Duration,
+    /// TCP connect timeout.
+    pub connect_timeout: Duration,
+    /// Active poll interval.
+    pub poll_active: Duration,
+    /// Idle poll interval.
+    pub poll_idle: Duration,
+    /// smoltcp tuning parameters.
+    pub smol_tuning: SmolTuningConfig,
+    /// Active blocked CIDR ranges.
+    pub blocked_networks: Vec<IpNet>,
+}
+
+impl RelayCliArgs {
+    /// Parse CLI arguments and validate into a `RelayConfig`.
+    pub fn into_config(self) -> Result<RelayConfig, ConfigError> {
+        let psk = resolve_psk(self.psk.as_deref(), self.psk_file.as_deref())?;
+
+        let mut blocked = if self.allow_private_networks {
+            info!("default private-network blocking disabled by --allow-private-networks");
+            vec![]
+        } else {
+            default_blocked_ranges()
+        };
+        for cidr_str in &self.disallow_networks {
+            let net: IpNet = cidr_str.parse().map_err(|e| ConfigError::InvalidCidr {
+                value: cidr_str.clone(),
+                source: e,
+            })?;
+            blocked.push(net);
+        }
+
+        Ok(RelayConfig {
+            controlled_domain: self.domain,
+            listen_addr: self.listen,
+            node_id: self.node_id,
+            psk,
+            message_ttl: Duration::from_secs(self.message_ttl_secs),
+            expiry_interval: Duration::from_secs(self.expiry_interval_secs),
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            poll_active: Duration::from_millis(self.poll_active_ms),
+            poll_idle: Duration::from_millis(self.poll_idle_ms),
+            smol_tuning: SmolTuningConfig {
+                initial_rto: Duration::from_millis(self.smol_rto_ms),
+                window_segments: self.smol_window_segments,
+                mss: self.smol_mss,
+            },
+            blocked_networks: blocked,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Relay SOCKS (dnssocksrelay)
+// ---------------------------------------------------------------------------
+
+/// CLI arguments for the dnssocksrelay binary.
+#[derive(Parser, Debug)]
+#[command(name = "dnssocksrelay", version, about = "SOCKS5 proxy client that tunnels TCP traffic through a dnsrelay instance")]
+pub struct RelaySocksCliArgs {
+    /// Controlled DNS domain (e.g. "tunnel.example.com").
+    #[arg(long)]
+    pub domain: String,
+
+    /// DNS resolver (dnsrelay) address, e.g. "127.0.0.1:53".
+    #[arg(long)]
+    pub resolver: SocketAddr,
+
+    /// Client identifier used as sender_id prefix.
+    #[arg(long)]
+    pub client_id: String,
+
+    /// Exit node identifier (dnsrelay's node-id).
+    #[arg(long)]
+    pub exit_node_id: String,
+
+    /// Pre-shared key as a hex-encoded string.
+    #[arg(long, group = "psk_source")]
+    pub psk: Option<String>,
+
+    /// Path to a file containing the raw PSK bytes.
+    #[arg(long, group = "psk_source")]
+    pub psk_file: Option<PathBuf>,
+
+    /// Local listen address (default: 127.0.0.1).
+    #[arg(long, default_value = "127.0.0.1")]
+    pub listen_addr: IpAddr,
+
+    /// Local listen port (default: 1080).
+    #[arg(long, default_value_t = 1080)]
+    pub listen_port: u16,
+
+    /// Session setup timeout in milliseconds (default: 30000).
+    #[arg(long, default_value_t = 30000)]
+    pub connect_timeout_ms: u64,
+
+    /// Active poll interval in milliseconds (default: 50).
+    #[arg(long, default_value_t = 50)]
+    pub poll_active_ms: u64,
+
+    /// Idle poll interval in milliseconds (default: 500).
+    #[arg(long, default_value_t = 500)]
+    pub poll_idle_ms: u64,
+
+    /// Maximum backoff interval in milliseconds (default: value of poll_idle_ms).
+    #[arg(long)]
+    pub backoff_max_ms: Option<u64>,
+
+    /// smoltcp initial RTO in milliseconds (default: 3000).
+    #[arg(long, default_value_t = 3000)]
+    pub smol_rto_ms: u64,
+
+    /// smoltcp TCP window size in MSS multiples (default: 4).
+    #[arg(long, default_value_t = 4)]
+    pub smol_window_segments: usize,
+
+    /// Override smoltcp MSS (default: auto-computed from DNS payload budget).
+    #[arg(long)]
+    pub smol_mss: Option<usize>,
+
+    /// Disable EDNS0 OPT record on TXT queries.
+    #[arg(long)]
+    pub no_edns: bool,
+
+    /// Minimum interval between DNS queries in milliseconds (default: 0 = no throttle).
+    #[arg(long, default_value_t = 0)]
+    pub query_interval_ms: u64,
+
+    /// Maximum number of concurrent active sessions (default: 8).
+    #[arg(long, default_value_t = 8)]
+    pub max_concurrent_sessions: usize,
+
+    /// Queue timeout in milliseconds for waiting connections (default: 30000).
+    #[arg(long, default_value_t = 30000)]
+    pub queue_timeout_ms: u64,
+}
+
+/// Validated configuration for the dnssocksrelay binary.
+pub struct RelaySocksConfig {
+    /// Controlled DNS domain.
+    pub controlled_domain: String,
+    /// DNS resolver (dnsrelay) address.
+    pub resolver_addr: SocketAddr,
+    /// Client identifier.
+    pub client_id: String,
+    /// Exit node identifier.
+    pub exit_node_id: String,
+    /// Pre-shared key (≥ 32 bytes).
+    pub psk: Psk,
+    /// Local listen address.
+    pub listen_addr: IpAddr,
+    /// Local listen port.
+    pub listen_port: u16,
+    /// Session setup timeout.
+    pub connect_timeout: Duration,
+    /// Active poll interval.
+    pub poll_active: Duration,
+    /// Idle poll interval.
+    pub poll_idle: Duration,
+    /// Maximum backoff interval.
+    pub backoff_max: Duration,
+    /// smoltcp tuning parameters.
+    pub smol_tuning: SmolTuningConfig,
+    /// Whether to disable EDNS0 on TXT queries.
+    pub no_edns: bool,
+    /// Minimum interval between DNS queries.
+    pub query_interval: Duration,
+    /// Maximum number of concurrent active sessions.
+    pub max_concurrent_sessions: usize,
+    /// Queue timeout for waiting connections.
+    pub queue_timeout: Duration,
+}
+
+impl RelaySocksCliArgs {
+    /// Parse CLI arguments and validate into a `RelaySocksConfig`.
+    pub fn into_config(self) -> Result<RelaySocksConfig, ConfigError> {
+        if self.max_concurrent_sessions < 1 {
+            return Err(ConfigError::InvalidMaxConcurrentSessions {
+                got: self.max_concurrent_sessions,
+            });
+        }
+
+        let psk = resolve_psk(self.psk.as_deref(), self.psk_file.as_deref())?;
+        let poll_idle = Duration::from_millis(self.poll_idle_ms);
+        let backoff_max = match self.backoff_max_ms {
+            Some(ms) => Duration::from_millis(ms),
+            None => poll_idle,
+        };
+
+        Ok(RelaySocksConfig {
+            controlled_domain: self.domain,
+            resolver_addr: self.resolver,
+            client_id: self.client_id,
+            exit_node_id: self.exit_node_id,
+            psk,
+            listen_addr: self.listen_addr,
+            listen_port: self.listen_port,
+            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
+            poll_active: Duration::from_millis(self.poll_active_ms),
+            poll_idle,
+            backoff_max,
+            smol_tuning: SmolTuningConfig {
+                initial_rto: Duration::from_millis(self.smol_rto_ms),
+                window_segments: self.smol_window_segments,
+                mss: self.smol_mss,
+            },
+            no_edns: self.no_edns,
+            query_interval: Duration::from_millis(self.query_interval_ms),
+            max_concurrent_sessions: self.max_concurrent_sessions,
+            queue_timeout: Duration::from_millis(self.queue_timeout_ms),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1309,5 +1605,187 @@ mod tests {
         cli.query_interval_ms = 100;
         let cfg = cli.into_config().unwrap();
         assert_eq!(cfg.query_interval, Duration::from_millis(100));
+    }
+
+    // --- RelayCliArgs ---
+
+    fn base_relay_cli() -> RelayCliArgs {
+        RelayCliArgs {
+            domain: "tunnel.example.com".into(),
+            listen: "0.0.0.0:53".parse().unwrap(),
+            node_id: "mynode".into(),
+            psk: Some("bb".repeat(32)),
+            psk_file: None,
+            message_ttl_secs: 600,
+            expiry_interval_secs: 30,
+            connect_timeout_ms: 10000,
+            poll_active_ms: 50,
+            poll_idle_ms: 500,
+            smol_rto_ms: 3000,
+            smol_window_segments: 4,
+            smol_mss: None,
+            allow_private_networks: false,
+            disallow_networks: vec![],
+        }
+    }
+
+    #[test]
+    fn relay_config_defaults() {
+        let cfg = base_relay_cli().into_config().unwrap();
+        assert_eq!(cfg.controlled_domain, "tunnel.example.com");
+        assert_eq!(cfg.listen_addr, "0.0.0.0:53".parse::<SocketAddr>().unwrap());
+        assert_eq!(cfg.node_id, "mynode");
+        assert_eq!(cfg.message_ttl, Duration::from_secs(600));
+        assert_eq!(cfg.expiry_interval, Duration::from_secs(30));
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.poll_active, Duration::from_millis(50));
+        assert_eq!(cfg.poll_idle, Duration::from_millis(500));
+        assert_eq!(cfg.smol_tuning.initial_rto, Duration::from_millis(3000));
+        assert_eq!(cfg.smol_tuning.window_segments, 4);
+        assert_eq!(cfg.smol_tuning.mss, None);
+    }
+
+    #[test]
+    fn relay_config_no_psk() {
+        let mut cli = base_relay_cli();
+        cli.psk = None;
+        cli.psk_file = None;
+        assert!(cli.into_config().is_err());
+    }
+
+    #[test]
+    fn relay_config_default_blocked_networks() {
+        let cfg = base_relay_cli().into_config().unwrap();
+        assert_eq!(cfg.blocked_networks, default_blocked_ranges());
+    }
+
+    #[test]
+    fn relay_config_allow_private_networks() {
+        let mut cli = base_relay_cli();
+        cli.allow_private_networks = true;
+        let cfg = cli.into_config().unwrap();
+        assert!(cfg.blocked_networks.is_empty());
+    }
+
+    #[test]
+    fn relay_config_disallow_network_adds_range() {
+        let mut cli = base_relay_cli();
+        cli.disallow_networks = vec!["203.0.113.0/24".into()];
+        let cfg = cli.into_config().unwrap();
+        let expected_extra: IpNet = "203.0.113.0/24".parse().unwrap();
+        assert!(cfg.blocked_networks.contains(&expected_extra));
+        assert_eq!(cfg.blocked_networks.len(), default_blocked_ranges().len() + 1);
+    }
+
+    #[test]
+    fn relay_config_invalid_cidr_produces_error() {
+        let mut cli = base_relay_cli();
+        cli.disallow_networks = vec!["not-a-cidr".into()];
+        let result = cli.into_config();
+        assert!(matches!(result, Err(ConfigError::InvalidCidr { .. })));
+    }
+
+    #[test]
+    fn relay_config_custom_tuning() {
+        let mut cli = base_relay_cli();
+        cli.smol_rto_ms = 5000;
+        cli.smol_window_segments = 8;
+        cli.smol_mss = Some(100);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.smol_tuning.initial_rto, Duration::from_millis(5000));
+        assert_eq!(cfg.smol_tuning.window_segments, 8);
+        assert_eq!(cfg.smol_tuning.mss, Some(100));
+    }
+
+    // --- RelaySocksCliArgs ---
+
+    fn base_relay_socks_cli() -> RelaySocksCliArgs {
+        RelaySocksCliArgs {
+            domain: "tunnel.example.com".into(),
+            resolver: "127.0.0.1:53".parse().unwrap(),
+            client_id: "myclient".into(),
+            exit_node_id: "mynode".into(),
+            psk: Some("aa".repeat(32)),
+            psk_file: None,
+            listen_addr: "127.0.0.1".parse().unwrap(),
+            listen_port: 1080,
+            connect_timeout_ms: 30000,
+            poll_active_ms: 50,
+            poll_idle_ms: 500,
+            backoff_max_ms: None,
+            smol_rto_ms: 3000,
+            smol_window_segments: 4,
+            smol_mss: None,
+            no_edns: false,
+            query_interval_ms: 0,
+            max_concurrent_sessions: 8,
+            queue_timeout_ms: 30000,
+        }
+    }
+
+    #[test]
+    fn relay_socks_config_defaults() {
+        let cfg = base_relay_socks_cli().into_config().unwrap();
+        assert_eq!(cfg.controlled_domain, "tunnel.example.com");
+        assert_eq!(cfg.resolver_addr, "127.0.0.1:53".parse::<SocketAddr>().unwrap());
+        assert_eq!(cfg.client_id, "myclient");
+        assert_eq!(cfg.exit_node_id, "mynode");
+        assert_eq!(cfg.listen_addr, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(cfg.listen_port, 1080);
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.poll_active, Duration::from_millis(50));
+        assert_eq!(cfg.poll_idle, Duration::from_millis(500));
+        assert_eq!(cfg.max_concurrent_sessions, 8);
+        assert_eq!(cfg.queue_timeout, Duration::from_secs(30));
+        assert_eq!(cfg.smol_tuning.initial_rto, Duration::from_millis(3000));
+        assert_eq!(cfg.smol_tuning.window_segments, 4);
+        assert_eq!(cfg.smol_tuning.mss, None);
+        assert!(!cfg.no_edns);
+        assert_eq!(cfg.query_interval, Duration::ZERO);
+    }
+
+    #[test]
+    fn relay_socks_config_no_psk() {
+        let mut cli = base_relay_socks_cli();
+        cli.psk = None;
+        cli.psk_file = None;
+        assert!(cli.into_config().is_err());
+    }
+
+    #[test]
+    fn relay_socks_zero_concurrent_sessions_rejected() {
+        let mut cli = base_relay_socks_cli();
+        cli.max_concurrent_sessions = 0;
+        let result = cli.into_config();
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidMaxConcurrentSessions { got: 0 })
+        ));
+    }
+
+    #[test]
+    fn relay_socks_backoff_defaults_to_poll_idle() {
+        let cfg = base_relay_socks_cli().into_config().unwrap();
+        assert_eq!(cfg.backoff_max, cfg.poll_idle);
+    }
+
+    #[test]
+    fn relay_socks_backoff_override() {
+        let mut cli = base_relay_socks_cli();
+        cli.backoff_max_ms = Some(2000);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.backoff_max, Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn relay_socks_custom_tuning() {
+        let mut cli = base_relay_socks_cli();
+        cli.smol_rto_ms = 5000;
+        cli.smol_window_segments = 8;
+        cli.smol_mss = Some(100);
+        let cfg = cli.into_config().unwrap();
+        assert_eq!(cfg.smol_tuning.initial_rto, Duration::from_millis(5000));
+        assert_eq!(cfg.smol_tuning.window_segments, 8);
+        assert_eq!(cfg.smol_tuning.mss, Some(100));
     }
 }

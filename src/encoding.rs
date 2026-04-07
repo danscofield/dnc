@@ -31,6 +31,13 @@ pub fn encode_envelope(msg: &StoredMessage) -> String {
     )
 }
 
+/// Encode envelope parts directly without requiring a `StoredMessage`.
+/// Produces the same `sender_id|sequence|timestamp|base32_payload` format.
+pub fn encode_envelope_parts(sender_id: &str, sequence: u64, timestamp: u64, payload: &[u8]) -> String {
+    let encoded_payload = base32_encode(payload);
+    format!("{}|{}|{}|{}", sender_id, sequence, timestamp, encoded_payload)
+}
+
 /// Decode a TXT envelope string back into components.
 pub fn decode_envelope(envelope: &str) -> Result<EnvelopeParts, DecodeError> {
     let parts: Vec<&str> = envelope.splitn(4, '|').collect();
