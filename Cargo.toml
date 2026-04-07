@@ -18,6 +18,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 atty = "0.2"
+crossterm = "0.28"
 
 [dev-dependencies]
 proptest = "1"
@@ -25,3 +26,7 @@ proptest = "1"
 [[example]]
 name = "dnc"
 path = "examples/dnc.rs"
+
+[[example]]
+name = "dchat"
+path = "examples/dchat.rs"

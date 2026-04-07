@@ -6,6 +6,7 @@ The system has three components:
 
 - **dns-message-broker** — A DNS server that acts as a per-channel FIFO message store. Clients send data by encoding it in DNS A query names; receivers poll with TXT queries. Can be used standalone as a simple DNS-based messaging channel without the SOCKS tunnel.
 - **dnc** — A netcat-style CLI for sending and receiving messages through the broker directly. Useful for testing, scripting, or simple data exfiltration without the full tunnel stack.
+- **dchat** — A dumb IRC-like chat over the broker. Join a room with a nickname and talk. Messages are plain DNS queries — no encryption, no sessions, just vibes.
 - **socks-client** — Runs on your workstation. Exposes a standard SOCKS5 proxy on localhost. Applications (browsers, curl, etc.) connect to it normally. Traffic is fragmented, encrypted, and tunneled through DNS.
 - **exit-node** — Runs on a server. Receives tunneled requests via the broker, makes the actual TCP connections, and returns responses over DNS. Can run the broker in-process (embedded mode) or talk to a separate broker over DNS (standalone mode).
 
@@ -131,6 +132,7 @@ src/                      # DNS Message Broker
   error.rs                # Error types
 examples/
   dnc.rs                  # DNS netcat — CLI tool for sending/receiving messages
+  dchat.rs                # DNS chat — IRC-like rooms over the broker
 ```
 
 ## Performance
@@ -250,6 +252,37 @@ dnc -d tunnel.example.com -l -1 general > output.txt           # receive to file
 | `-b` | system resolver | Broker address (e.g. `127.0.0.1:5353`) |
 | `-d` | `broker.example.com` | Controlled domain |
 | `-v` | — | Verbose output on stderr |
+
+### dchat (DNS chat)
+
+IRC-like chat rooms over the DNS Message Broker. No encryption, no sessions — just nicknames and rooms. Features a split-screen TUI with scrolling chat and a fixed input line.
+
+All participants in a room see all messages via cursor-based peek reads (non-destructive). Messages persist in the broker until they expire, so late joiners may see recent history.
+
+```bash
+dchat -n alice -r lobby                     # join "lobby" as "alice"
+dchat -n bob -r lobby -b 127.0.0.1:5353     # direct to local broker
+dchat -n eve -r secret -d tunnel.example.com  # different room and domain
+```
+
+Example session (two terminals):
+
+```
+# Terminal 1                          # Terminal 2
+$ dchat -n alice -r lobby             $ dchat -n bob -r lobby
+  joined #lobby as alice                joined #lobby as bob
+> hey bob                             <alice> hey bob
+<bob> sup                             > sup
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-n` | required | Your nickname |
+| `-r` | `lobby` | Room (channel) to join |
+| `-b` | system resolver | Broker address (e.g. `127.0.0.1:5353`) |
+| `-d` | `broker.example.com` | Controlled domain |
+
+Controls: type and press Enter to send, Ctrl+C or Esc to quit. The terminal is fully restored on exit.
 
 ## License
 

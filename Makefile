@@ -1,5 +1,6 @@
 BINARY        := dns-message-broker
 EXAMPLE       := dnc
+EXAMPLE2      := dchat
 SOCKS_CLIENT  := socks-client
 EXIT_NODE     := exit-node
 VERSION       := $(shell cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
@@ -14,7 +15,7 @@ MACOS_ARM  := aarch64-apple-darwin
 .PHONY: all build test clean dist linux-x64 linux-arm macos-x64 macos-arm setup
 
 # Touch crate roots to force cargo to rebuild everything.
-TOUCH_SOURCES := src/lib.rs src/main.rs crates/dns-socks-proxy/src/lib.rs crates/dns-socks-proxy/src/bin/socks_client.rs crates/dns-socks-proxy/src/bin/exit_node.rs examples/dnc.rs
+TOUCH_SOURCES := src/lib.rs src/main.rs crates/dns-socks-proxy/src/lib.rs crates/dns-socks-proxy/src/bin/socks_client.rs crates/dns-socks-proxy/src/bin/exit_node.rs examples/dnc.rs examples/dchat.rs
 
 all: build
 
@@ -36,6 +37,7 @@ define COPY_BINS
 	@mkdir -p $(DIST)/$(1)
 	cp target/$(1)/release/$(BINARY) $(DIST)/$(1)/
 	cp target/$(1)/release/examples/$(EXAMPLE) $(DIST)/$(1)/
+	cp target/$(1)/release/examples/$(EXAMPLE2) $(DIST)/$(1)/
 	cp target/$(1)/release/$(SOCKS_CLIENT) $(DIST)/$(1)/
 	cp target/$(1)/release/$(EXIT_NODE) $(DIST)/$(1)/
 	@echo "Built: $(DIST)/$(1)/"
