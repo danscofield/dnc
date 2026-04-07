@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 
 /// DNS Message Broker — an authoritative DNS server for lightweight datagram transport.
 #[derive(Parser)]
-#[command(name = "dns-message-broker", version, about)]
+#[command(name = "dns-fifo-broker", version, about)]
 struct Cli {
     /// Path to the TOML configuration file.
     config: PathBuf,

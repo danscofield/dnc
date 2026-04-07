@@ -1,12 +1,12 @@
-BINARY        := dns-message-broker
+BINARY        := dns-fifo-broker
 EXAMPLE       := dnc
 EXAMPLE2      := dchat
-SOCKS_CLIENT  := socks-client
-EXIT_NODE     := exit-node
-SMOL_CLIENT   := smol-client
-SMOL_EXIT     := smol-exit
-DNSRELAY      := dnsrelay
-DNSSOCKSRELAY := dnssocksrelay
+SOCKS_CLIENT  := dns-socksd-fifo
+EXIT_NODE     := dns-exit-fifo
+SMOL_CLIENT   := dns-socksd-smol-fifo
+SMOL_EXIT     := dns-exit-smol-fifo
+DNSRELAY      := dns-exit-smol-rb
+DNSSOCKSRELAY := dns-socksd-smol-rb
 VERSION       := $(shell cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
 DIST          := dist
 
@@ -112,7 +112,7 @@ tarballs: tarball-linux-x64 tarball-linux-arm tarball-macos-x64 tarball-macos-ar
 # --- Run relay (local testing) ---
 
 run-relay:
-	RUST_LOG=info cargo run -p dns-socks-proxy --bin dnsrelay -- \
+	RUST_LOG=info cargo run -p dns-socks-proxy --bin dns-exit-smol-rb -- \
 		--domain tunnel.example.com \
 		--listen 127.0.0.1:5353 \
 		--node-id relay1 \
@@ -120,7 +120,7 @@ run-relay:
 		--allow-private-networks
 
 run-relay-client:
-	RUST_LOG=info cargo run -p dns-socks-proxy --bin dnssocksrelay -- \
+	RUST_LOG=info cargo run -p dns-socks-proxy --bin dns-socksd-smol-rb -- \
 		--domain tunnel.example.com \
 		--resolver 127.0.0.1:5353 \
 		--client-id client1 \

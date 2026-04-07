@@ -23,6 +23,10 @@ crossterm = "0.28"
 [dev-dependencies]
 proptest = "1"
 
+[[bin]]
+name = "dns-fifo-broker"
+path = "src/main.rs"
+
 [[example]]
 name = "dnc"
 path = "examples/dnc.rs"

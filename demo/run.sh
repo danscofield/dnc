@@ -28,7 +28,7 @@ trap cleanup EXIT
 echo "==> Building project..."
 cargo build --release --examples 2>&1 | tail -1
 
-BROKER_BIN="$ROOT/target/release/dns-message-broker"
+BROKER_BIN="$ROOT/target/release/dns-fifo-broker"
 DNC="$ROOT/target/release/examples/dnc"
 
 echo ""

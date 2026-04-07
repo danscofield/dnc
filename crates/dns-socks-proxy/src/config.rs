@@ -58,7 +58,7 @@ pub enum DeploymentMode {
 
 /// CLI arguments for the socks-client binary.
 #[derive(Parser, Debug)]
-#[command(name = "socks-client", version, about = "SOCKS5 proxy client that tunnels TCP traffic over DNS")]
+#[command(name = "dns-socksd-fifo", version, about = "SOCKS5 proxy client that tunnels TCP traffic over DNS")]
 pub struct SocksClientCli {
     /// Local listen address (default: 127.0.0.1).
     #[arg(long, default_value = "127.0.0.1")]
@@ -234,7 +234,7 @@ impl SocksClientCli {
 
 /// CLI arguments for the exit-node binary.
 #[derive(Parser, Debug)]
-#[command(name = "exit-node", version, about = "Exit node that terminates DNS-tunneled TCP connections")]
+#[command(name = "dns-exit-fifo", version, about = "Exit node that terminates DNS-tunneled TCP connections")]
 pub struct ExitNodeCli {
     /// Controlled DNS domain (e.g. "tunnel.example.com").
     #[arg(long)]
@@ -473,7 +473,7 @@ impl Default for SmolTuningConfig {
 
 /// CLI arguments for the smol-client binary.
 #[derive(Parser, Debug)]
-#[command(name = "smol-client", version, about = "SOCKS5 proxy client that tunnels TCP traffic over DNS using smoltcp")]
+#[command(name = "dns-socksd-smol-fifo", version, about = "SOCKS5 proxy client that tunnels TCP traffic over DNS using smoltcp")]
 pub struct SmolClientCli {
     /// Local listen address (default: 127.0.0.1).
     #[arg(long, default_value = "127.0.0.1")]
@@ -639,7 +639,7 @@ impl SmolClientCli {
 
 /// CLI arguments for the smol-exit binary.
 #[derive(Parser, Debug)]
-#[command(name = "smol-exit", version, about = "Exit node that terminates DNS-tunneled TCP connections using smoltcp")]
+#[command(name = "dns-exit-smol-fifo", version, about = "Exit node that terminates DNS-tunneled TCP connections using smoltcp")]
 pub struct SmolExitCli {
     /// Controlled DNS domain (e.g. "tunnel.example.com").
     #[arg(long)]
@@ -814,7 +814,7 @@ impl SmolExitCli {
 
 /// CLI arguments for the dnsrelay binary.
 #[derive(Parser, Debug)]
-#[command(name = "dnsrelay", version, about = "DNS relay server with integrated smoltcp exit node")]
+#[command(name = "dns-exit-smol-rb", version, about = "DNS relay server with integrated smoltcp exit node")]
 pub struct RelayCliArgs {
     /// Controlled DNS domain (e.g. "tunnel.example.com").
     #[arg(long)]
@@ -948,7 +948,7 @@ impl RelayCliArgs {
 
 /// CLI arguments for the dnssocksrelay binary.
 #[derive(Parser, Debug)]
-#[command(name = "dnssocksrelay", version, about = "SOCKS5 proxy client that tunnels TCP traffic through a dnsrelay instance")]
+#[command(name = "dns-socksd-smol-rb", version, about = "SOCKS5 proxy client that tunnels TCP traffic through a dns-exit-smol-rb instance")]
 pub struct RelaySocksCliArgs {
     /// Controlled DNS domain (e.g. "tunnel.example.com").
     #[arg(long)]

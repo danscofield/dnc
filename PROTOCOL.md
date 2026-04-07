@@ -1,6 +1,6 @@
 # Protocol
 
-This document describes the wire protocol used by the DNS tunnel system. The protocol has three layers: a base messaging layer (used by all components including `dnc`), a tunnel session layer (used by `socks-client` and `exit-node`), and an alternative smoltcp tunnel layer (used by `smol-client` and `smol-exit`).
+This document describes the wire protocol used by the DNS tunnel system. The protocol has three layers: a base messaging layer (used by all components including `dnc`), a tunnel session layer (used by `dns-socksd-fifo` and `dns-exit-fifo`), and an alternative smoltcp tunnel layer (used by `dns-socksd-smol-fifo`/`dns-exit-smol-fifo` and `dns-socksd-smol-rb`/`dns-exit-smol-rb`).
 
 ## Base Layer: DNS Message Broker
 
@@ -9,6 +9,54 @@ The broker is a store-and-forward relay that uses DNS as the transport. It liste
 ### Channels
 
 Messages are organized into named channels (arbitrary strings like `inbox`, `ctl-e1`, `u-aBcD1234`). Each channel is an independent FIFO queue with configurable capacity and TTL.
+
+#### FIFO Queue Store Model
+
+```
+Channel "u-aBcD1234"
+┌─────────────────────────────────────────────────────────┐
+│  FIFO Queue (max 100 messages, configurable)            │
+│                                                         │
+│  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐          │
+│  │seq=1│→ │seq=2│→ │seq=3│→ │seq=4│→ │seq=5│→ ...      │
+│  │alice│  │bob  │  │alice│  │alice│  │bob  │           │
+│  └─────┘  └─────┘  └─────┘  └─────┘  └─────┘          │
+│  oldest                                    newest       │
+│                                                         │
+│  Replay Buffer (served messages, re-deliverable)        │
+│  ┌─────┐  ┌─────┐                                      │
+│  │seq=1│  │seq=2│  ← cleared when cursor advances      │
+│  └─────┘  └─────┘                                      │
+└─────────────────────────────────────────────────────────┘
+
+Write: push to back of queue (reject if full)
+Read:  peek from front, copy to replay buffer
+Pop:   destructive read, no replay
+Cursor: client sends -c<seq>, broker prunes replay < seq
+```
+
+#### FIFO Receive Flow
+
+```
+Client                              Broker (ChannelStore)
+  │                                    │
+  │── TXT query ──────────────────────>│
+  │   nonce42-c3.channel.domain        │  cursor=3: prune replay < 3
+  │                                    │  peek up to N messages (AIMD)
+  │<──── TXT response ────────────────│
+  │   [env1] [env2] ... [envN]        │  copy served → replay buffer
+  │   (up to 8 records, AIMD-tuned)   │
+  │                                    │
+  │── next poll, cursor advanced ─────>│
+  │   nonce99-c8.channel.domain        │  cursor=8: prune replay < 8
+  │                                    │  AIMD: increase max_messages
+  │                                    │
+  │── next poll, cursor stalled ──────>│
+  │   nonceXX-c8.channel.domain        │  cursor=8: same as before
+  │                                    │  AIMD: stall_count++
+  │                                    │  if stall_count >= 2: halve max
+  │                                    │
+```
 
 ### Send (A query)
 
@@ -125,7 +173,7 @@ Each tunnel uses three channel types:
 | Upstream | `u-<session_id>` | Client → exit node data |
 | Downstream | `d-<session_id>` | Exit node → client data |
 
-The control channel is shared across all sessions for a given client/exit-node pair. Data channels are per-session.
+The control channel is shared across all sessions for a given client/exit node pair. Data channels are per-session.
 
 ### Frame Format
 
@@ -256,7 +304,7 @@ The exit node supports two deployment modes:
 
 ## smoltcp Tunnel Session Layer
 
-An alternative tunnel implementation using [smoltcp](https://github.com/smoltcp-rs/smoltcp), a userspace TCP/IP stack. Uses the same base messaging layer and encryption as the standard tunnel, but replaces the hand-rolled reliability protocol with a real TCP state machine. The smol binaries (smol-client, smol-exit) are not compatible with the standard binaries — they use different session setup messages and data framing.
+An alternative tunnel implementation using [smoltcp](https://github.com/smoltcp-rs/smoltcp), a userspace TCP/IP stack. Uses the same base messaging layer and encryption as the standard tunnel, but replaces the hand-rolled reliability protocol with a real TCP state machine. The smol-fifo binaries (`dns-socksd-smol-fifo`, `dns-exit-smol-fifo`) are not compatible with the standard binaries — they use different session setup messages and data framing.
 
 ### Channels
 
@@ -274,7 +322,7 @@ The smol tunnel uses a different set of control messages (distinct from the stan
 
 #### Init (0x10)
 
-Sent by smol-client on `ctl-<exit_node_id>`:
+Sent by dns-socksd-smol-fifo on `ctl-<exit_node_id>`:
 
 ```
 Offset  Size  Field
@@ -292,7 +340,7 @@ Followed by 16-byte HMAC-SHA256 MAC (truncated, using PSK).
 
 #### InitAck (0x11)
 
-Sent by smol-exit on `ctl-<client_id>`:
+Sent by dns-exit-smol-fifo on `ctl-<client_id>`:
 
 ```
 Offset  Size  Field
@@ -342,8 +390,8 @@ Each session creates a point-to-point virtual IP network:
 
 | Role | Virtual IP | Purpose |
 |------|-----------|---------|
-| smol-client | `192.168.69.1` | Client-side smoltcp interface |
-| smol-exit | `192.168.69.2` | Exit-side smoltcp interface |
+| dns-socksd-smol-fifo | `192.168.69.1` | Client-side smoltcp interface |
+| dns-exit-smol-fifo | `192.168.69.2` | Exit-side smoltcp interface |
 
 The client's smoltcp TCP socket connects to `192.168.69.2:4321`. The exit's smoltcp TCP socket listens on `192.168.69.2:4321`. One TCP connection per smoltcp Interface — the virtual IPs are reused across sessions since each session has its own isolated Interface.
 
@@ -397,11 +445,74 @@ All broker channel reads use cursor-based advancement (`cursor + 1` after each b
 
 ## Relay Mode
 
-An alternative deployment where the broker and exit node run in a single process (`dnsrelay`), using a `RelayStore` instead of the standard FIFO `ChannelStore`. The client binary is `dnssocksrelay`. Relay mode uses the same smoltcp tunnel session layer (Init/InitAck/Teardown, encrypted IP packets, same key exchange) but with a different store backend and a two-phase receive protocol.
+An alternative deployment where the broker and exit node run in a single process (`dns-exit-smol-rb`), using a `RelayStore` instead of the standard FIFO `ChannelStore`. The client binary is `dns-socksd-smol-rb`. Relay mode uses the same smoltcp tunnel session layer (Init/InitAck/Teardown, encrypted IP packets, same key exchange) but with a different store backend and a two-phase receive protocol.
 
 ### RelayStore
 
 Unlike the standard broker's per-channel FIFO queue, the RelayStore uses a bounded ring buffer per (channel, sender_id) pair. Each write pushes to the ring buffer; when full (default 64 slots), the oldest entry is dropped. Reads are non-destructive — slots persist until they expire (configurable TTL) or are explicitly acknowledged.
+
+#### Ring Buffer Store Model
+
+```
+Channel "d-aBcD1234"
+┌──────────────────────────────────────────────────────────────┐
+│  Ring Buffer per sender (max 64 slots each)                  │
+│                                                              │
+│  sender="server1"                                            │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐     ┌──────┐ │
+│  │seq=10│ │seq=15│ │seq=20│ │seq=25│ │seq=30│ ... │seq=99│ │
+│  │ 72B  │ │ 72B  │ │ 72B  │ │ 72B  │ │ 72B  │     │ 72B  │ │
+│  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘     └──────┘ │
+│  ↑ oldest (dropped when ring full)          newest ↑        │
+│                                                              │
+│  sender="server2"                                            │
+│  ┌──────┐ ┌──────┐ ┌──────┐                                 │
+│  │seq=12│ │seq=18│ │seq=24│                                  │
+│  └──────┘ └──────┘ └──────┘                                 │
+└──────────────────────────────────────────────────────────────┘
+
+Write: push to sender's ring buffer (drop oldest if full)
+Read:  non-destructive, all non-expired slots across all senders
+Ack:   explicit ack_sequences(channel, [seq_ids]) removes slots
+```
+
+#### Two-Phase Receive Flow
+
+```
+Client (DedupRecvTransport)          Relay (RelayStore)
+  │                                    │
+  │── Phase 1: Manifest ─────────────>│
+  │   m<nonce>.channel.domain          │  read all non-expired slots
+  │                                    │  format: seq,len,seq,len,...
+  │<──── TXT: compact manifest ───────│
+  │   "99,72,98,72,97,72,...,10,72"   │  (50+ entries fit in 1 response)
+  │                                    │
+  │   Filter: remove already-seen      │
+  │   seen={99,98,97,96,95}           │
+  │   needed={94,93,...,10}            │
+  │                                    │
+  │── Phase 2: Fetch (batch 1/3) ────>│
+  │   f<nonce>.94-93-92-91-90         │  read_sequences([94,93,92,91,90])
+  │          .channel.domain           │
+  │<──── TXT: 5 full envelopes ──────│
+  │                                    │
+  │── Phase 2: Fetch (batch 2/3) ────>│
+  │   f<nonce>.89-88-87-86-85         │
+  │          .channel.domain           │
+  │<──── TXT: 5 full envelopes ──────│
+  │                                    │
+  │   ... (continue batches of 5)      │
+  │                                    │
+  │── Ack received sequences ────────>│
+  │   ack_sequences(ch, [94..85])      │  remove acked slots from ring
+  │                                    │
+
+  If all manifest seqs already seen:
+  │── Phase 1: Manifest ─────────────>│
+  │<──── TXT: manifest ──────────────│
+  │   Filter: needed=[] (all seen)     │
+  │   SKIP Phase 2 (saves round-trip)  │
+```
 
 Each slot has:
 - `sender_id` — who wrote it
@@ -471,8 +582,8 @@ After receiving envelopes, the client calls `store.ack_sequences(channel, &seq_i
 
 | Binary | Role | Description |
 |--------|------|-------------|
-| `dnsrelay` | Server | Combined broker + exit node. Listens for DNS queries, routes to RelayStore, manages smoltcp sessions. |
-| `dnssocksrelay` | Client | SOCKS5 proxy client. Uses `DnsTransport` for send, `DedupRecvTransport` (wrapping `DnsTransport`) for two-phase receive. |
+| `dns-exit-smol-rb` | Server | Combined broker + exit node. Listens for DNS queries, routes to RelayStore, manages smoltcp sessions. |
+| `dns-socksd-smol-rb` | Client | SOCKS5 proxy client. Uses `DnsTransport` for send, `DedupRecvTransport` (wrapping `DnsTransport`) for two-phase receive. |
 
 Both use the same smoltcp tunnel session layer — Init/InitAck/Teardown on control channels, encrypted IP packets on data channels, same key exchange and encryption.
 

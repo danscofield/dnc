@@ -26,25 +26,25 @@ smoltcp = { version = "0.12", features = ["medium-ip", "proto-ipv4", "socket-tcp
 proptest = "1"
 
 [[bin]]
-name = "socks-client"
+name = "dns-socksd-fifo"
 path = "src/bin/socks_client.rs"
 
 [[bin]]
-name = "exit-node"
+name = "dns-exit-fifo"
 path = "src/bin/exit_node.rs"
 
 [[bin]]
-name = "smol-client"
+name = "dns-socksd-smol-fifo"
 path = "src/bin/smol_client.rs"
 
 [[bin]]
-name = "smol-exit"
+name = "dns-exit-smol-fifo"
 path = "src/bin/smol_exit.rs"
 
 [[bin]]
-name = "dnsrelay"
+name = "dns-exit-smol-rb"
 path = "src/bin/dnsrelay.rs"
 
 [[bin]]
-name = "dnssocksrelay"
+name = "dns-socksd-smol-rb"
 path = "src/bin/dnssocksrelay.rs"

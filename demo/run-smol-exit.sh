@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run the smol-exit in embedded mode (broker in-process).
-# The broker listens on 0.0.0.0:5353 for DNS queries from smol-clients.
+# Run the dns-exit-smol-fifo in embedded mode (broker in-process).
+# The broker listens on 0.0.0.0:5353 for DNS queries from dns-socksd-smol-fifo clients.
 #
 # This is the smoltcp-based alternative to run-exit-node.sh.
 # Uses the same PSK, same broker config, same domain — just a different
@@ -9,7 +9,7 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-exec "${SCRIPT_DIR}/../target/release/smol-exit" \
+exec "${SCRIPT_DIR}/../target/release/dns-exit-smol-fifo" \
   --domain x.y.z \
   --node-id exitnode1 \
   --mode embedded \

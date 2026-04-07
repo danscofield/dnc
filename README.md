@@ -2,34 +2,70 @@
 
 Tunnel TCP traffic through DNS queries using a SOCKS5 interface.
 
-The system has three components:
+All data is encoded in DNS queries (A for send, TXT for receive), encrypted with ChaCha20-Poly1305 (per-session keys via X25519 + PSK), and relayed through a store-and-forward DNS server. The system offers two store backends and multiple tunnel implementations that can be mixed depending on the deployment.
 
-- **dns-message-broker** — A DNS server that acts as a per-channel FIFO message store. Clients send data by encoding it in DNS A query names; receivers poll with TXT queries. Can be used standalone as a simple DNS-based messaging channel without the SOCKS tunnel.
-- **dnc** — A netcat-style CLI for sending and receiving messages through the broker directly. Useful for testing, scripting, or simple data exfiltration without the full tunnel stack.
-- **dchat** — A dumb IRC-like chat over the broker. Join a room with a nickname and talk. Messages are plain DNS queries — no encryption, no sessions, just vibes.
+## Store backends
 
-There are two tunnel implementations that share the same broker, encryption, and SOCKS5 interface:
+The DNS server at the center of the tunnel stores data in one of two backends. Both use the same DNS wire format for send (A queries) and receive (TXT queries), but they differ in how messages are stored and delivered.
 
-- **socks-client / exit-node** — The original tunnel. Uses a minimal hand-rolled reliability layer (sliding window, retransmit buffer, SYN/ACK/FIN state machine). Intentionally keeps the state machine as simple as possible — just enough to get data through. No congestion control, no flow control, no out-of-order reassembly beyond the sliding window.
-- **smol-client / smol-exit** — Alternative tunnel using [smoltcp](https://github.com/smoltcp-rs/smoltcp), a userspace TCP/IP stack. The DNS channel is treated as a lossy datagram link carrying encrypted IP packets between two smoltcp instances. Gets a full TCP state machine — segmentation, retransmission, congestion control, flow control, FIN handshake — without needing a TUN device or root privileges.
-- **dnssocksrelay / dnsrelay** — Relay mode. The broker and exit node run in a single process (`dnsrelay`) using a ring-buffer-per-sender store instead of FIFO queues. The client (`dnssocksrelay`) uses a two-phase manifest+fetch protocol to selectively retrieve only the packets it needs, avoiding the response budget crowding-out problem that occurs when the ring buffer accumulates many slots. Uses the same smoltcp tunnel layer.
+### FIFO queue (`ChannelStore`)
 
-Neither implementation is particularly reliable. The DNS channel is fundamentally hostile to TCP-like protocols: ~100-byte payloads, multi-second round-trips through recursive resolvers, store-and-forward message queues with finite capacity, and no guarantee of delivery order. Both implementations work for short request/response patterns (curl, API calls) but will struggle with sustained transfers or high concurrency. The hand-rolled version is more predictable because it was designed for this specific link. The smoltcp version is more correct but fights its own assumptions about how a network should behave.
+Per-channel FIFO queue with configurable capacity and TTL. Messages are ordered, support destructive pop or non-destructive peek with a replay buffer, and use adaptive response sizing (AIMD) to maximize throughput through recursive resolvers. Best for the standard tunnel where ordering matters and the broker runs as a separate process.
+
+- Runs as a standalone DNS server (`dns-fifo-broker`), embedded in the exit node, or as a separate process from the exit node — broker and egress can live on different hosts
+- Supports cursor-based replay advancement to prevent stale re-delivery
+- Adaptive response sizing: starts at 2 TXT records per response, ramps to 8 via AIMD
+- Used by: `dns-socksd-fifo`/`dns-exit-fifo`, `dns-socksd-smol-fifo`/`dns-exit-smol-fifo`, `dnc`, `dchat`
+
+### Ring buffer (`RelayStore`)
+
+Bounded ring buffer per (channel, sender_id) pair. Each sender's newest writes push out the oldest. Reads are non-destructive — slots persist until they expire or are explicitly acknowledged. Uses a two-phase manifest+fetch protocol so clients can discover all available sequence IDs (compactly) and selectively retrieve only the ones they need.
+
+- Runs as a combined broker + exit node in a single process (`dns-exit-smol-rb`) — no broker/egress separation
+- Two-phase receive: manifest query lists all available seq IDs, fetch query retrieves specific ones in batches
+- No adaptive sizing — the manifest/fetch protocol handles the response budget constraint directly
+- Used by: `dns-socksd-smol-rb`/`dns-exit-smol-rb`
+
+### Comparison
+
+| | FIFO queue | Ring buffer |
+|---|---|---|
+| Store model | Ordered queue per channel | Ring buffer per (channel, sender) |
+| Capacity | Configurable max messages | 64 slots per sender (oldest dropped) |
+| Read semantics | Peek with replay, or destructive pop | Non-destructive, explicit ack to remove |
+| Response sizing | Adaptive AIMD (2-8 records) | Two-phase manifest+fetch |
+| Deployment | Standalone broker, embedded in exit node, or separate processes | Combined broker + exit node (single process only) |
+| Broker/egress separation | Yes — broker and exit node can run on different hosts | No — broker and exit node share a process and store |
+| Receive protocol | Single TXT query returns envelopes | Manifest query + batched fetch queries |
+| Best for | Standard tunnel, `dnc`, `dchat` | smoltcp ring buffer tunnel |
+
+## Tunnel implementations
+
+Three tunnel implementations share the same encryption, SOCKS5 interface, and DNS encoding. They differ in their reliability layer and which store backend they target.
+
+- **dns-socksd-fifo / dns-exit-fifo** — Hand-rolled reliability (sliding window, retransmit buffer, SYN/ACK/FIN). Simple and predictable. Uses FIFO queue backend. No congestion control or flow control.
+- **dns-socksd-smol-fifo / dns-exit-smol-fifo** — [smoltcp](https://github.com/smoltcp-rs/smoltcp) userspace TCP/IP stack. Full TCP state machine over the DNS link. Uses FIFO queue backend. More correct but fights its own assumptions about network behavior.
+- **dns-socksd-smol-rb / dns-exit-smol-rb** — smoltcp tunnel over the ring buffer backend. The broker and exit node run in one process. The client uses two-phase manifest+fetch to avoid the response budget crowding-out problem.
+
+None of these are particularly reliable. The DNS channel is fundamentally hostile to TCP-like protocols: ~100-byte payloads, multi-second round-trips through recursive resolvers, finite message queues, and no delivery guarantees. They work for short request/response patterns (curl, API calls) but will struggle with sustained transfers or high concurrency.
+
+## Standalone tools
+
+- **dnc** — Netcat-style CLI for sending and receiving messages through the broker directly. Useful for testing, scripting, or simple data exfiltration without the tunnel stack.
+- **dchat** — IRC-like chat rooms over the broker. No encryption, no sessions — just nicknames and rooms.
 
 ## How it works
 
 ```
-Application → SOCKS5 → client → DNS A queries → Broker → exit → Target
+Application → SOCKS5 → client → DNS A queries → Store → exit → Target
                               ← DNS TXT responses ←
 ```
 
-Data is encrypted with ChaCha20-Poly1305 (per-session keys via X25519 + PSK) and encoded as DNS queries. The broker is a simple store-and-forward relay — all tunnel logic (sessions, reliability, encryption) lives in the two endpoints.
-
-The standard tunnel (socks-client/exit-node) splits data into ~104-byte frames with a 15-byte header, sequence numbers, and explicit ACK/retransmit logic. The smoltcp tunnel (smol-client/smol-exit) wraps raw IP packets produced by smoltcp in a 12-byte header (session ID + sequence number) and encrypts them the same way. Both use the same broker channels and DNS encoding.
+Data is encrypted with ChaCha20-Poly1305 (per-session keys via X25519 + PSK) and encoded as DNS queries. The store is a simple relay — all tunnel logic (sessions, reliability, encryption) lives in the endpoints.
 
 See [PROTOCOL.md](PROTOCOL.md) for the full wire protocol specification.
 
-## Quick start
+## Quick start (FIFO queue)
 
 ### 1. Generate a PSK
 
@@ -39,7 +75,7 @@ head -c 32 /dev/urandom > psk.key
 
 Both sides need the same key.
 
-### 2. Run the exit-node (server side)
+### 2. Run the exit node (server side)
 
 Create a broker config (`broker.toml`):
 
@@ -53,10 +89,10 @@ listen_port = 53
 # max_response_messages = 4
 ```
 
-Run in embedded mode (broker + exit-node in one process):
+Run in embedded mode (broker + exit node in one process):
 
 ```bash
-./exit-node \
+./dns-exit-fifo \
   --domain tunnel.example.com \
   --node-id e1 \
   --mode embedded \
@@ -68,12 +104,12 @@ Run in embedded mode (broker + exit-node in one process):
 
 Add an NS record for `tunnel.example.com` pointing to your server's IP.
 
-### 4. Run the socks-client (workstation side)
+### 4. Run the client (workstation side)
 
 Direct to broker:
 
 ```bash
-./socks-client \
+./dns-socksd-fifo \
   --domain tunnel.example.com \
   --resolver <server-ip>:53 \
   --client-id c1 \
@@ -84,7 +120,7 @@ Direct to broker:
 Through a recursive resolver:
 
 ```bash
-./socks-client \
+./dns-socksd-fifo \
   --domain tunnel.example.com \
   --resolver 1.1.1.1:53 \
   --client-id c1 \
@@ -100,14 +136,14 @@ curl -x socks5h://127.0.0.1:1080 http://icanhazip.com
 
 Or configure Firefox: Settings → Network → SOCKS5 proxy → `127.0.0.1:1080`, check "Proxy DNS when using SOCKS v5".
 
-### Alternative: smoltcp-based tunnel (smol-client / smol-exit)
+### Alternative: smoltcp-based tunnel (dns-socksd-smol-fifo / dns-exit-smol-fifo)
 
-The smol binaries are drop-in replacements that use smoltcp instead of the hand-rolled reliability layer. Same PSK, same broker, same SOCKS5 interface. You must pair smol-client with smol-exit — they can't mix with the standard binaries (different wire protocol for session setup and data framing).
+The smol-fifo binaries are drop-in replacements that use smoltcp instead of the hand-rolled reliability layer. Same PSK, same broker, same SOCKS5 interface. You must pair `dns-socksd-smol-fifo` with `dns-exit-smol-fifo` — they can't mix with the standard binaries (different wire protocol for session setup and data framing).
 
 Run the exit side:
 
 ```bash
-./smol-exit \
+./dns-exit-smol-fifo \
   --domain tunnel.example.com \
   --node-id e1 \
   --mode embedded \
@@ -118,7 +154,7 @@ Run the exit side:
 Run the client side:
 
 ```bash
-./smol-client \
+./dns-socksd-smol-fifo \
   --domain tunnel.example.com \
   --resolver <server-ip>:53 \
   --client-id c1 \
@@ -140,6 +176,38 @@ For the broker config, lower TTLs help with session cleanup:
 ```toml
 message_ttl_secs = 30
 expiry_interval_secs = 5
+```
+
+### Alternative: relay mode (dns-socksd-smol-rb / dns-exit-smol-rb)
+
+The relay binaries use the ring buffer backend. The broker and exit node run in a single process — no separate broker config needed.
+
+Run the server side:
+
+```bash
+./dns-exit-smol-rb \
+  --domain tunnel.example.com \
+  --node-id r1 \
+  --listen 0.0.0.0:5300 \
+  --psk-file psk.key \
+  --allow-private-networks
+```
+
+Run the client side:
+
+```bash
+./dns-socksd-smol-rb \
+  --domain tunnel.example.com \
+  --resolver <server-ip>:5300 \
+  --client-id c1 \
+  --exit-node-id r1 \
+  --psk-file psk.key
+```
+
+Then use it the same way:
+
+```bash
+curl -x socks5h://127.0.0.1:1080 http://icanhazip.com
 ```
 
 ## Building
@@ -172,15 +240,15 @@ crates/
       smol_poll.rs        # smoltcp Interface helpers, poll loop, PollDirection
       relay_transport.rs  # RelayTransport (direct store), DedupRecvTransport (two-phase manifest+fetch)
       bin/
-        socks_client.rs   # SOCKS5 proxy client (hand-rolled reliability)
-        exit_node.rs      # Exit node (hand-rolled reliability)
-        smol_client.rs    # SOCKS5 proxy client (smoltcp)
-        smol_exit.rs      # Exit node (smoltcp)
-        dnssocksrelay.rs  # SOCKS5 proxy client (relay mode, smoltcp + selective fetch)
-        dnsrelay.rs       # Combined broker + exit node (relay mode)
+        socks_client.rs   # dns-socksd-fifo (hand-rolled reliability)
+        exit_node.rs      # dns-exit-fifo (hand-rolled reliability)
+        smol_client.rs    # dns-socksd-smol-fifo (smoltcp + FIFO)
+        smol_exit.rs      # dns-exit-smol-fifo (smoltcp + FIFO)
+        dnssocksrelay.rs  # dns-socksd-smol-rb (smoltcp + ring buffer)
+        dnsrelay.rs       # dns-exit-smol-rb (smoltcp + ring buffer)
 src/                      # DNS Message Broker
   lib.rs                  # Crate root, re-exports
-  main.rs                 # Broker binary entry point
+  main.rs                 # dns-fifo-broker binary entry point
   server.rs               # UDP DNS server loop
   handler.rs              # Query routing (send via A, receive via TXT)
   relay_handler.rs        # Relay query routing (manifest/fetch/legacy TXT modes)
@@ -197,13 +265,13 @@ examples/
 
 ## Reliability
 
-DNS tunneling is inherently unreliable. The channel has ~100-byte payloads, multi-second round-trips through recursive resolvers, finite message queues, and no delivery guarantees. Both tunnel implementations handle this differently:
+DNS tunneling is inherently unreliable. The channel has ~100-byte payloads, multi-second round-trips through recursive resolvers, finite message queues, and no delivery guarantees.
 
-The standard tunnel (socks-client/exit-node) uses a minimal sliding window with explicit ACKs and retransmits. It's simple and predictable — designed specifically for this link. It doesn't try to be a full TCP implementation.
+The standard tunnel (`dns-socksd-fifo`/`dns-exit-fifo`) uses a minimal sliding window with explicit ACKs and retransmits. Simple and predictable — designed specifically for this link.
 
-The smoltcp tunnel (smol-client/smol-exit) runs a real TCP/IP stack over the DNS link. It gets proper congestion control, flow control, and TCP state management, but smoltcp's internal timers (initial RTO ~700ms, min RTO 10ms) are tuned for real networks, not DNS relays. This causes aggressive retransmissions that can flood the broker's message queues. The smol binaries mitigate this with larger socket buffers, separate DNS sockets for send/recv, and deferred session cleanup, but it's still a TCP stack running over a channel that violates most of TCP's assumptions.
+The smoltcp tunnel (`dns-socksd-smol-fifo`/`dns-exit-smol-fifo`, `dns-socksd-smol-rb`/`dns-exit-smol-rb`) runs a real TCP/IP stack over the DNS link. It gets proper congestion control, flow control, and TCP state management, but smoltcp's internal timers are tuned for real networks, not DNS relays. The ring buffer variant mitigates the response budget problem with two-phase manifest+fetch, so retransmits aren't crowded out by already-seen data.
 
-Both work for short request/response patterns. Neither is great for sustained transfers.
+All implementations work for short request/response patterns. None are great for sustained transfers.
 
 ## Performance
 
@@ -224,7 +292,7 @@ Each DNS message carries ~37-104 bytes of payload depending on domain length. Th
 
 ## CLI reference
 
-### socks-client
+### dns-socksd-fifo
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -247,7 +315,7 @@ Each DNS message carries ~37-104 bytes of payload depending on domain length. Th
 | `--max-concurrent-sessions` | `8` | Max concurrent active sessions |
 | `--queue-timeout-ms` | `30000` | Wait timeout for queued connections (0 = reject immediately) |
 
-### exit-node
+### dns-exit-fifo
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -269,9 +337,9 @@ Each DNS message carries ~37-104 bytes of payload depending on domain length. Th
 | `--allow-private-networks` | `false` | Disable default blocking of private/loopback/link-local ranges |
 | `--disallow-network` | — | Additional CIDR range to block (repeatable) |
 
-### smol-client
+### dns-socksd-smol-fifo
 
-Drop-in replacement for socks-client using smoltcp. Same flags minus the hand-rolled reliability knobs, plus smoltcp tuning.
+Drop-in replacement for dns-socksd-fifo using smoltcp. Same flags minus the hand-rolled reliability knobs, plus smoltcp tuning.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -295,9 +363,9 @@ Drop-in replacement for socks-client using smoltcp. Same flags minus the hand-ro
 | `--smol-window-segments` | `4` | TCP window size in MSS multiples |
 | `--smol-mss` | auto | Override MSS (default: derived from DNS payload budget) |
 
-### smol-exit
+### dns-exit-smol-fifo
 
-Drop-in replacement for exit-node using smoltcp.
+Drop-in replacement for dns-exit-fifo using smoltcp.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -320,7 +388,7 @@ Drop-in replacement for exit-node using smoltcp.
 | `--smol-window-segments` | `4` | TCP window size in MSS multiples |
 | `--smol-mss` | auto | Override MSS (default: derived from DNS payload budget) |
 
-### dns-message-broker
+### dns-fifo-broker
 
 The broker is configured via a TOML file. Example with all fields:
 
