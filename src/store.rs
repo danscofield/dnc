@@ -7,6 +7,36 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::StoreError;
 
+/// Conservative starting point for adaptive max_messages.
+pub const ADAPTIVE_INITIAL_MAX: usize = 2;
+/// Minimum max_messages (never go below).
+pub const ADAPTIVE_FLOOR: usize = 2;
+/// Maximum max_messages (never exceed).
+pub const ADAPTIVE_CEILING: usize = 8;
+/// Consecutive stalls before multiplicative decrease.
+pub const STALL_THRESHOLD: u32 = 2;
+
+/// Per-channel adaptive response sizing state (AIMD algorithm).
+#[derive(Debug, Clone)]
+pub struct AdaptiveState {
+    /// Current adaptive limit for max_messages.
+    pub max_messages: usize,
+    /// Cursor value from the previous poll (None if no poll yet).
+    pub last_cursor_seen: Option<u64>,
+    /// Consecutive polls where cursor did not advance.
+    pub stall_count: u32,
+}
+
+impl Default for AdaptiveState {
+    fn default() -> Self {
+        Self {
+            max_messages: ADAPTIVE_INITIAL_MAX,
+            last_cursor_seen: None,
+            stall_count: 0,
+        }
+    }
+}
+
 /// Trait for injectable time, enabling deterministic testing.
 pub trait Clock {
     /// Returns the current `Instant` (monotonic clock).
@@ -56,6 +86,8 @@ pub struct Channel {
     pub replay: VecDeque<StoredMessage>,
     /// Sequence number of the oldest message in the replay buffer.
     pub replay_cursor: u64,
+    /// Per-channel adaptive response sizing state.
+    pub adaptive: AdaptiveState,
 }
 
 /// Thread-safe message store keyed by channel name.
@@ -114,6 +146,7 @@ impl<C: Clock> ChannelStore<C> {
                 last_activity: now,
                 replay: VecDeque::new(),
                 replay_cursor: 0,
+                adaptive: AdaptiveState::default(),
             }
         });
 
@@ -275,6 +308,62 @@ impl<C: Clock> ChannelStore<C> {
             ch.replay.retain(|msg| msg.expiry >= now);
             true
         });
+    }
+
+    /// Update the adaptive response sizing state for a channel based on cursor feedback.
+    ///
+    /// Implements the AIMD (Additive Increase / Multiplicative Decrease) algorithm:
+    /// - Cursor `None`: no update, return current max_messages
+    /// - First poll (last_cursor_seen is None): record cursor, return current max_messages
+    /// - Cursor advanced: reset stall_count, increment max_messages by 1 (capped at ADAPTIVE_CEILING)
+    /// - Cursor stalled: increment stall_count; if >= STALL_THRESHOLD, halve max_messages (floored at ADAPTIVE_FLOOR)
+    /// - Cursor regressed: ignore (stale/reordered query)
+    ///
+    /// Returns the current effective max_messages for the channel.
+    pub fn update_adaptive_state(&mut self, channel: &str, cursor: Option<u64>) -> usize {
+        let ch = match self.channels.get_mut(channel) {
+            Some(ch) => ch,
+            None => return ADAPTIVE_INITIAL_MAX,
+        };
+
+        let cursor = match cursor {
+            Some(c) => c,
+            None => return ch.adaptive.max_messages,
+        };
+
+        if ch.adaptive.last_cursor_seen.is_none() {
+            // First poll with cursor — just record it
+            ch.adaptive.last_cursor_seen = Some(cursor);
+            return ch.adaptive.max_messages;
+        }
+
+        let last = ch.adaptive.last_cursor_seen.unwrap();
+
+        if cursor > last {
+            // Cursor advanced — response got through
+            ch.adaptive.stall_count = 0;
+            ch.adaptive.max_messages = (ch.adaptive.max_messages + 1).min(ADAPTIVE_CEILING);
+        } else if cursor == last {
+            // Cursor stalled — response may have been dropped
+            ch.adaptive.stall_count += 1;
+            if ch.adaptive.stall_count >= STALL_THRESHOLD {
+                ch.adaptive.max_messages = (ch.adaptive.max_messages / 2).max(ADAPTIVE_FLOOR);
+                ch.adaptive.stall_count = 0;
+            }
+        }
+        // cursor < last: stale/reordered query — ignore
+
+        ch.adaptive.last_cursor_seen = Some(cursor);
+        ch.adaptive.max_messages
+    }
+
+    /// Read-only accessor returning the channel's current adaptive max_messages.
+    ///
+    /// Returns `ADAPTIVE_INITIAL_MAX` if the channel doesn't exist.
+    pub fn get_adaptive_max_messages(&self, channel: &str) -> usize {
+        self.channels
+            .get(channel)
+            .map_or(ADAPTIVE_INITIAL_MAX, |ch| ch.adaptive.max_messages)
     }
 
     /// Returns a reference to the internal channels map (for testing).

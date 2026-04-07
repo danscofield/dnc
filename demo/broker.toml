@@ -8,3 +8,7 @@ log_level = "debug"
 max_messages_per_channel = 100
 message_ttl_secs = 300
 channel_inactivity_timeout_secs = 600
+
+# Adaptive response sizing: omit for AIMD auto-tuning (default).
+# Uncomment to use a fixed value for all channels.
+# max_response_messages = 4

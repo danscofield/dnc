@@ -38,6 +38,10 @@ Create a broker config (`broker.toml`):
 controlled_domain = "tunnel.example.com"
 listen_addr = "0.0.0.0"
 listen_port = 53
+
+# Optional: override adaptive response sizing with a fixed value.
+# When omitted, the broker uses AIMD to auto-tune per channel (recommended).
+# max_response_messages = 4
 ```
 
 Run in embedded mode (broker + exit-node in one process):
@@ -134,7 +138,7 @@ Direct to broker: ~3 seconds for a simple HTTP request (SYN + request + response
 
 Through recursive resolver: slower due to extra DNS hops, but functional.
 
-Each DNS message carries ~104 bytes of payload. The tunnel uses EDNS0 to batch up to 2 frames per TXT response (~600 bytes max), keeping responses small enough to survive recursive resolvers that drop oversized UDP packets. Cursor-based replay advancement ensures frames are re-delivered when DNS responses are lost, eliminating the previous heuristic that could permanently lose data.
+Each DNS message carries ~104 bytes of payload. The tunnel uses adaptive response sizing — the broker starts conservatively at 2 TXT records per response and ramps up (to a max of 8) as it confirms responses are getting through, or backs off when they're dropped. This keeps responses small enough to survive recursive resolvers while maximizing throughput. Cursor-based replay advancement ensures frames are re-delivered when DNS responses are lost, eliminating the previous heuristic that could permanently lose data.
 
 ## Security
 
@@ -188,6 +192,38 @@ Each DNS message carries ~104 bytes of payload. The tunnel uses EDNS0 to batch u
 | `--backoff-max-ms` | value of `--poll-idle-ms` | Maximum backoff interval (ms) |
 | `--connect-timeout-ms` | `10000` | TCP connect timeout (ms) |
 | `--max-parallel-queries` | `8` | Parallel TXT queries per poll cycle |
+
+### dns-message-broker
+
+The broker is configured via a TOML file. Example with all fields:
+
+```toml
+controlled_domain = "tunnel.example.com"   # required
+listen_addr = "0.0.0.0"                    # default: "::" (dual-stack)
+listen_port = 53                           # default: 53
+max_messages_per_channel = 100             # default: 100
+message_ttl_secs = 600                     # default: 600
+channel_inactivity_timeout_secs = 3600     # default: 3600
+expiry_interval_secs = 30                  # default: 30
+log_level = "info"                         # default: "info"
+
+# Adaptive response sizing override (optional).
+# Omit to use AIMD auto-tuning (recommended for most deployments).
+# Set to a fixed number to bypass adaptive logic for all channels.
+# max_response_messages = 4
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `controlled_domain` | required | The DNS domain the broker is authoritative for |
+| `listen_addr` | `::` | Address to bind (IPv6 `::` accepts both v4 and v6) |
+| `listen_port` | `53` | UDP port |
+| `max_messages_per_channel` | `100` | Max queued messages per channel |
+| `message_ttl_secs` | `600` | Message expiry (seconds) |
+| `channel_inactivity_timeout_secs` | `3600` | Idle channel cleanup (seconds) |
+| `expiry_interval_secs` | `30` | Sweep interval for expired messages |
+| `log_level` | `info` | Logging level (`trace`, `debug`, `info`, `warn`, `error`, `off`) |
+| `max_response_messages` | adaptive | Fixed max TXT records per response. Omit for AIMD auto-tuning |
 
 ### dnc (DNS netcat)
 

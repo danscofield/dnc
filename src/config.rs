@@ -66,6 +66,10 @@ pub struct Config {
     /// Error IP returned when channel is full.
     #[serde(default = "default_error_channel_full_ip")]
     pub error_channel_full_ip: Ipv4Addr,
+    /// Optional fixed max response messages override.
+    /// When set, bypasses adaptive sizing and uses this value for all channels.
+    #[serde(default)]
+    pub max_response_messages: Option<usize>,
 }
 
 // --- Serde default functions ---

@@ -66,7 +66,16 @@ The broker returns pending messages as TXT records. Each TXT record contains an 
 - `timestamp` — Unix epoch seconds when stored
 - `base32_payload` — RFC 4648 base32, lowercase, no padding
 
-If EDNS0 is present with a UDP buffer ≥1232 bytes, the broker batches up to 2 messages into a single response (capped to keep responses under ~600 bytes, avoiding drops by recursive resolvers). Without EDNS0, one message per response.
+#### Adaptive Response Sizing
+
+The broker uses adaptive response sizing to maximize throughput while avoiding silent drops by recursive resolvers.
+
+- **No EDNS0** (UDP buffer < 1232): always 1 message per response.
+- **EDNS0 present** (UDP buffer ≥ 1232), peek mode: the broker uses an AIMD (Additive Increase, Multiplicative Decrease) algorithm per channel. New channels start conservatively at 2 messages. When the client's cursor advances between polls (confirming the previous response was received), the broker increases `max_messages` by 1 (up to a ceiling of 8). When the cursor stalls for 2 consecutive polls (suggesting the response was dropped), the broker halves `max_messages` (down to a floor of 2). This finds each resolver's sweet spot automatically.
+- **EDNS0 present**, pop mode: uses a static formula `min(((udp_size - 100) / 250), 2)` — adaptive state is not consulted.
+- **Config override**: setting `max_response_messages` in the broker config bypasses adaptive logic and uses a fixed value for all channels.
+
+Without EDNS0, one message per response.
 
 ### Status (A query)
 
