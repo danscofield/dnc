@@ -4,6 +4,8 @@ Tunnel TCP traffic through DNS queries using a SOCKS5 interface.
 
 All data is encoded in DNS queries (A for send, TXT for receive), encrypted with ChaCha20-Poly1305 (per-session keys via X25519 + PSK), and relayed through a store-and-forward DNS server. The system offers two store backends and multiple tunnel implementations that can be mixed depending on the deployment.
 
+***Important***: This project is just a fun experiment. You should never do any of this and should instead just use something like QUIC if you want to tunnel traffic. [Slipstream](https://github.com/EndPositive/slipstream) does it well. 
+
 ## Store backends
 
 The DNS server at the center of the tunnel stores data in one of two backends. Both use the same DNS wire format for send (A queries) and receive (TXT queries), but they differ in how messages are stored and delivered.
